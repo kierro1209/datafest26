@@ -346,35 +346,67 @@ def _infer_patient_context_vocab_sizes(patient_context_to_id: dict[str, Any], fi
     return sizes
 
 
-def load_prepared_pt(input_path: Path) -> PreparedData:
+def _companion_vocab_path(input_path: Path) -> Path:
+    name = input_path.name
+    if name.startswith("patient_sequences_") and name.endswith(".pt"):
+        suffix = name[len("patient_sequences_") : -len(".pt")]
+        return input_path.with_name(f"sequence_model_vocab_{suffix}.json")
+    return input_path.with_suffix(".json")
+
+
+def _load_vocab_payload(vocab_path: Path) -> dict[str, Any]:
+    if not vocab_path.exists():
+        return {}
+    return json.loads(vocab_path.read_text(encoding="utf-8"))
+
+
+def _first_available(payloads: list[dict[str, Any]], key: str, default: Any = None) -> Any:
+    for payload in payloads:
+        if isinstance(payload, dict) and key in payload and payload[key] is not None:
+            return payload[key]
+    return default
+
+
+def load_prepared_pt(input_path: Path, vocab_path: Path | None = None) -> PreparedData:
     raw = torch.load(input_path, map_location="cpu")
     if not isinstance(raw, dict) or "sequences" not in raw:
         raise SystemExit(f"Unexpected PT artifact format: {input_path}")
+
+    vocab_payload = _load_vocab_payload(vocab_path or _companion_vocab_path(input_path))
+    payloads = [raw, vocab_payload]
 
     sequences_raw = raw.get("sequences") or []
     if not isinstance(sequences_raw, list):
         raise SystemExit("PT artifact has invalid sequences payload.")
 
-    type_to_id = _pad_mapping(raw.get("type_to_id"))
-    event_description_to_id = _pad_mapping(raw.get("event_description_to_id"))
-    group_code_to_id = _pad_mapping(raw.get("group_code_to_id"))
-    diagnosis_value_to_id = _pad_mapping(raw.get("diagnosis_value_to_id"))
-    gap_to_id = _pad_mapping(raw.get("gap_to_id"))
-    setting_to_id = _pad_mapping(raw.get("setting_to_id"))
-    dept_type_to_id = _pad_mapping(raw.get("dept_type_to_id"))
-    dept_specialty_to_id = _pad_mapping(raw.get("dept_specialty_to_id"))
-    facility_size_to_id = _pad_mapping(raw.get("facility_size_to_id"))
-    region_to_id = _pad_mapping(raw.get("region_to_id"))
-    sdoh_status_to_id = _pad_mapping(raw.get("sdoh_status_to_id") or {"UNKNOWN_NOT_YET_MEASURED": 0, "NEGATIVE_NO_NEED": 1, "POSITIVE_NEED_OR_RISK": 2, "OTHER_DECLINED_UNABLE_UNSPECIFIED": 3})
-    patient_context_to_id = dict(raw.get("patient_context_to_id") or {})
+    type_to_id = _pad_mapping(_first_available(payloads, "type_to_id", {}))
+    event_description_to_id = _pad_mapping(_first_available(payloads, "event_description_to_id", {}))
+    group_code_to_id = _pad_mapping(_first_available(payloads, "group_code_to_id", {}))
+    diagnosis_value_to_id = _pad_mapping(_first_available(payloads, "diagnosis_value_to_id", {}))
+    gap_to_id = _pad_mapping(_first_available(payloads, "gap_to_id", {}))
+    setting_to_id = _pad_mapping(_first_available(payloads, "setting_to_id", {}))
+    dept_type_to_id = _pad_mapping(_first_available(payloads, "dept_type_to_id", {}))
+    dept_specialty_to_id = _pad_mapping(_first_available(payloads, "dept_specialty_to_id", {}))
+    facility_size_to_id = _pad_mapping(_first_available(payloads, "facility_size_to_id", {}))
+    region_to_id = _pad_mapping(_first_available(payloads, "region_to_id", {}))
+    sdoh_status_to_id = _pad_mapping(
+        _first_available(
+            payloads,
+            "sdoh_status_to_id",
+            {"UNKNOWN_NOT_YET_MEASURED": 0, "NEGATIVE_NO_NEED": 1, "POSITIVE_NEED_OR_RISK": 2, "OTHER_DECLINED_UNABLE_UNSPECIFIED": 3},
+        )
+    )
+    patient_context_to_id = dict(_first_available(payloads, "patient_context_to_id", {}))
 
     sample = next((seq for seq in sequences_raw if isinstance(seq, dict)), None)
     if sample is None:
         raise SystemExit("No valid patient sequences were found in the PT artifact.")
 
-    sdoh_fields = sorted(
-        key for key in sample.keys() if key.startswith("sdoh_") and key.endswith("_latest_status_ids")
-    )
+    sdoh_fields = _first_available(payloads, "sdoh_status_fields")
+    if not isinstance(sdoh_fields, list) or not sdoh_fields:
+        sdoh_fields = sorted(
+            key for key in sample.keys() if key.startswith("sdoh_") and key.endswith("_latest_status_ids")
+        )
     patient_context_fields = sorted((sample.get("patient_context_ids") or {}).keys())
     numeric_candidates = ["patient_lat", "patient_lon", "patient_population"]
     patient_numeric_fields = [
@@ -424,7 +456,7 @@ def load_prepared_pt(input_path: Path) -> PreparedData:
             continue
         sequences.append(prepared_seq)
 
-    metadata = dict(raw.get("metadata") or {})
+    metadata = dict(_first_available(payloads, "metadata", {}))
     metadata.update(
         {
             "n_training_sequences": int(len(sequences)),
@@ -578,8 +610,8 @@ def save_artifacts(output_dir: Path, prepared: PreparedData, model: nn.Module, h
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train a multi-task autoregressive patient event sequence model.")
-    p.add_argument("--input", type=Path, default=Path("token_sequence_model/patient_sequences_encounter_only_with_sdoh_status_and_fips.pt"))
-    p.add_argument("--census", type=Path, default=Path("data/raw/tigercensuscodes.csv"))
+    p.add_argument("--input", type=Path, default=Path("modelling/token_sequence_model/patient_sequences_encounter_only_with_sdoh_status_and_fips.pt"))
+    p.add_argument("--vocab-json", type=Path, default=Path("modelling/token_sequence_model/sequence_model_vocab_encounter_only_with_sdoh_status_and_fips.json"))
     p.add_argument("--output-dir", type=Path, default=Path("data/processed/patient_event_model"))
     p.add_argument("--backbone", choices=["transformer", "gru", "lstm"], default="transformer")
     p.add_argument("--d-model", type=int, default=128)
@@ -611,6 +643,12 @@ def main() -> None:
     args = parse_args()
     if not args.input.exists():
         raise SystemExit(f"Input not found: {args.input}")
+    if args.vocab_json and not args.vocab_json.exists():
+        inferred_vocab = _companion_vocab_path(args.input)
+        if inferred_vocab.exists():
+            args.vocab_json = inferred_vocab
+        else:
+            raise SystemExit(f"Vocab JSON not found: {args.vocab_json}")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -618,7 +656,7 @@ def main() -> None:
 
     if args.input.suffix != ".pt":
         raise SystemExit("This training script now expects the final tokenized .pt artifact as --input.")
-    prepared = load_prepared_pt(args.input)
+    prepared = load_prepared_pt(args.input, args.vocab_json)
     if not prepared.sequences:
         raise SystemExit("No patient sequences with at least two events were found.")
 
