@@ -144,7 +144,15 @@ def load_encounters(
     if max_rows is not None:
         read_kw["nrows"] = max_rows * 3 if table_kind == "event_enriched" else max_rows
 
-    df = pd.read_csv(**read_kw)
+    chunks = []
+    seen = 0
+    for chunk in pd.read_csv(**read_kw, chunksize=500_000):
+        chunks.append(chunk)
+        seen += len(chunk)
+        if max_rows and seen >= max_rows:
+            break
+
+    df = pd.concat(chunks, ignore_index=True) 
 
     if table_kind == "event_enriched":
         df = df.loc[df["event_grain"].astype(str).str.upper().eq("ENCOUNTER")].drop(
@@ -683,7 +691,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--input",
         type=Path,
-        default=_ROOT / "data/processed/event_enriched.csv.gz",
+        default=_ROOT / "data/processed/event_enriched.csv",
         help="Encounter-level CSV.gz (event_enriched or encounter_enriched export).",
     )
     p.add_argument(

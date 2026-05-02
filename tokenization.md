@@ -2,48 +2,41 @@
 
 ## Purpose
 
-This folder contains the tokenized patient sequences used for the next-event sequence model.
+This folder contains the final tokenized patient sequences for the next-encounter sequence model.
 
-The goal is to predict the next patient event or visit and the information needed for resource planning:
+The project goal is to predict a patient's next clinical encounter and the information needed for resource planning:
 
-- WHAT: visit/event type and diagnosis
-- WHEN: time until the next event
-- WHERE: care setting, department type, department volume, and region
+- WHAT: visit type, visit description, diagnosis group, and detailed diagnosis
+- WHEN: time gap until the next encounter
+- WHERE: care setting, department type, department specialty, department volume, and region
+- CONTEXT: static patient profile, approximate home-area geography, and rolling SDOH status known so far
 
-The tokenization is patient-sequence based:
+The final design is encounter-sequence based:
 
-one patient -> one ordered sequence of events
+one patient -> one ordered sequence of clinical encounters
 
-This is different from a journey-only design:
-
-one patient + one DiagnosisValue -> one journey sequence
-
-We keep patient-level sequences because a patient can have multiple diagnosis journeys, and the next visit may depend on their full recent history.
+SDOH response rows are not treated as prediction targets. Instead, SDOH information is converted into rolling latest-status streams that provide context for each encounter.
 
 ---
 
-## Final output files
+## Final model-ready files
 
-The final model-ready files are:
+Use these final artifacts for modeling:
 
-- patient_sequences_for_model_with_diagnosis.pt
-- sequence_model_vocab_with_diagnosis.json
-- sequence_model_events.csv.gz
+- patient_sequences_encounter_only_with_sdoh_status_and_fips.pt
+- sequence_model_vocab_encounter_only_with_sdoh_status_and_fips.json
 
-Use this file for modeling:
+Earlier intermediate artifacts may exist, but the final modeling file is:
 
-- patient_sequences_for_model_with_diagnosis.pt
-
-The earlier file, patient_sequences_for_model.pt, does not include the patched diagnosis streams.
+patient_sequences_encounter_only_with_sdoh_status_and_fips.pt
 
 ---
 
 ## Main PyTorch artifact
 
-patient_sequences_for_model_with_diagnosis.pt contains a dictionary with:
+patient_sequences_encounter_only_with_sdoh_status_and_fips.pt contains a dictionary with:
 
 - sequences
-- vocab
 - gap_to_id
 - setting_to_id
 - dept_type_to_id
@@ -51,98 +44,216 @@ patient_sequences_for_model_with_diagnosis.pt contains a dictionary with:
 - region_to_id
 - group_code_to_id
 - diagnosis_value_to_id
+- type_to_id
+- event_description_to_id
+- dept_specialty_to_id
+- patient_context_to_id
+- sdoh_status_to_id
 - metadata
 
-Each item in sequences is one patient:
+Each item in sequences is one patient.
+
+Each patient sequence contains encounter-level streams, rolling SDOH status streams, and static patient context.
+
+---
+
+## Final sequence shape
+
+A final sequence may look like this:
 
 {
-"patient_id": "...",
-"event_token_ids": [...],
-"gap_ids": [...],
-"setting_ids": [...],
-"dept_type_ids": [...],
-"facility_size_ids": [...],
-"region_ids": [...],
-"group_code_ids": [...],
-"diagnosis_value_ids": [...]
+"patient_id": "P001",
+
+"type_ids": [12, 12, 30, 4],
+"event_description_ids": [55, 81, 102, 9],
+"group_code_ids": [41, 41, 41, 88],
+"diagnosis_value_ids": [892, 892, 901, 1440],
+
+"setting_ids": [5, 5, 5, 0],
+"dept_type_ids": [2, 2, 2, 1],
+"dept_specialty_ids": [14, 14, 23, 7],
+"facility_size_ids": [3, 3, 4, 5],
+"region_ids": [6, 6, 6, 8],
+
+"gap_ids": [0, 3, 4, 2],
+
+"sdoh_transportation_needs_latest_status_ids": [0, 2, 2, 2],
+"sdoh_food_insecurity_latest_status_ids": [0, 0, 0, 2],
+"sdoh_housing_stability_latest_status_ids": [0, 0, 0, 0],
+"sdoh_financial_resource_strain_latest_status_ids": [0, 0, 1, 1],
+
+"patient_context_ids": {
+"PatientBirthYearBin": 12,
+"SexAssignedAtBirth": 2,
+"OmbRace": 4,
+"OmbEthnicity": 1,
+"SmokingStatus": 3,
+"MaritalStatus": 2
+},
+
+"patient_context_values": {
+"patient_lat": 39.05,
+"patient_lon": -95.67,
+"patient_population": 1320.0,
+"CensusBlockGroupFipsCode": "201770045001"
+}
 }
 
-All arrays are aligned by event position. Position i in every array describes the same patient event.
+All encounter-level lists are aligned by position.
+
+For example, index 2 means the patient's third encounter:
+
+- type_ids[2]
+- event_description_ids[2]
+- group_code_ids[2]
+- diagnosis_value_ids[2]
+- setting_ids[2]
+- dept_type_ids[2]
+- dept_specialty_ids[2]
+- facility_size_ids[2]
+- region_ids[2]
+- gap_ids[2]
+- every sdoh\_\*\_latest_status_ids[2]
+
+all describe the same encounter.
+
+patient_context_ids and patient_context_values are patient-level static context dictionaries, not event-level lists.
+
+## Encounter-level WHAT streams
+
+### type_ids
+
+Broad encounter type.
+
+This describes the general type of visit or clinical interaction.
+
+Example decoded labels might include:
+
+- OFFICE_VISIT
+- HOSPITAL_ENCOUNTER
+- ED_VISIT
+- TELEPHONE
+- APPOINTMENT
+
+Used for predicting what kind of encounter is likely next.
+
+### event_description_ids
+
+More specific encounter or visit description.
+
+This is usually based on VisitTypeDescription or event_description.
+
+Example decoded labels might include:
+
+- FOLLOW_UP
+- NEW_PATIENT
+- ROUTINE_VISIT
+- PROCEDURE_VISIT
+- EMERGENCY_VISIT
+
+Used for predicting a more specific visit subtype.
+
+### group_code_ids
+
+Integer-coded GroupCode.
+
+This is the broad diagnosis group.
+
+Used for predicting the next encounter's broad diagnosis category.
+
+### diagnosis_value_ids
+
+Integer-coded DiagnosisValue.
+
+This is the detailed diagnosis value.
+
+Used for predicting the next encounter's detailed diagnosis.
+
+This is important for resource planning because it gives a more specific clinical signal than GroupCode.
 
 ---
 
-## Event vs encounter
+## Encounter-level WHERE streams
 
-In this project:
+### setting_ids
 
-encounter = one recorded interaction in the raw encounter table
+Care setting for the encounter.
 
-event = one timeline item used by the sequence model
+Possible labels include:
 
-One encounter can create multiple events:
+- ED
+- INPATIENT
+- HOSP_ADMIT
+- HOSP_OP
+- OBS
+- OP_FACE
+- NONE
+- UNKNOWN
 
-- 1 encounter row -> 1 ENCOUNTER event
-- 1 SDOH answer row -> 1 SDOH_RESPONSE event
+Used for predicting the next encounter's care setting.
 
-So a patient sequence can include both clinical encounter events and SDOH response events.
+### dept_type_ids
 
-For predicting next visits, we may later evaluate primarily on ENCOUNTER events, but SDOH events are useful context.
+Department type.
+
+This captures the broad department category.
+
+Used for predicting where the next encounter may occur at a department-type level.
+
+### dept_specialty_ids
+
+Department specialty.
+
+This captures specialty context such as cardiology, endocrinology, family medicine, emergency medicine, etc.
+
+This is especially useful for provider and specialty capacity planning.
+
+### facility_size_ids
+
+Department volume bin.
+
+Despite the name, this is a department event-volume proxy, not true physical facility size.
+
+Possible labels include:
+
+- VERY_LOW
+- LOW
+- MID
+- HIGH
+- VERY_HIGH
+- MISSING
+- UNKNOWN
+
+Used as a resource-intensity proxy.
+
+### region_ids
+
+Rough department geography label.
+
+The tokenizer builds region labels from available department location fields, prioritizing:
+
+department_County -> department_City -> department_PostalCode
+
+Examples may include:
+
+- COUNTY_SHAWNEE
+- CITY_TOPEKA
+- ZIP_66604
+- UNKNOWN
+
+Used for predicting the next encounter's approximate service region.
 
 ---
 
-## What an event token looks like
-
-Each event has a controlled composite token.
-
-Example:
-
-EVENT_COMPOSITE::SRC=ENCOUNTER|GRAIN=ENCOUNTER|TYPE=OFFICE_VISIT|DESC=FOLLOW_UP|DXG=E11|SETTING=OP_FACE|DEPT_TYPE=CLINIC|DEPT_SPEC=ENDOCRINOLOGY|VOL=HIGH|GAP=8_30D|SDOH=UNKNOWN
-
-This long token is mapped to an integer ID.
-
-Example:
-
-EVENT_COMPOSITE::SRC=ENCOUNTER|... -> 12345
-
-The patient sequence stores the integer in event_token_ids.
-
----
-
-## Main event token components
-
-The main event token is intentionally broad and controlled. It includes:
-
-- SRC: event source, such as ENCOUNTER or SDOH_RESPONSE
-- GRAIN: event grain, such as ENCOUNTER or SDOH_RESPONSE
-- TYPE: visit/event type
-- DESC: visit type description or event description
-- DXG: diagnosis group code
-- SETTING: care setting
-- DEPT_TYPE: department type
-- DEPT_SPEC: department specialty
-- VOL: department event-volume bin
-- GAP: time gap bin from previous event
-- SDOH: SDOH domain for SDOH response events
-
-We intentionally do not put exact DiagnosisValue inside the main event token, because DiagnosisValue is high-cardinality. Instead, DiagnosisValue is preserved separately in diagnosis_value_ids.
-
----
-
-## Sequence fields
-
-### event_token_ids
-
-Main broad event-state sequence.
-
-This captures a compact summary of WHAT, WHERE, and WHEN for each event.
-
-Used to predict the next broad event state.
+## Encounter-level WHEN stream
 
 ### gap_ids
 
-Time gap category before each event.
+Time gap category since the previous clinical encounter for the same patient.
 
-Examples:
+After the encounter-only patch, gap_ids are recomputed between encounters only.
+
+Possible labels:
 
 - START
 - 0D
@@ -154,177 +265,152 @@ Examples:
 - 365PLUS
 - UNKNOWN
 
-Used for next-event WHEN prediction.
-
-### setting_ids
-
-Care setting for each event.
-
-Examples:
-
-- ED
-- INPATIENT
-- HOSP_ADMIT
-- HOSP_OP
-- OBS
-- OP_FACE
-- NONE
-- UNKNOWN
-
-Used for next-event WHERE / care setting prediction.
-
-### dept_type_ids
-
-Department type for each event.
-
-Used for next-event WHERE / department category prediction.
-
-### facility_size_ids
-
-Department event-volume bin for each event.
-
-Despite the name, this is currently a department volume proxy, not true physical facility size.
-
-Examples:
-
-- VERY_LOW
-- LOW
-- MID
-- HIGH
-- VERY_HIGH
-- MISSING
-- UNKNOWN
-
-Used for resource planning and WHERE/resource-intensity prediction.
-
-### region_ids
-
-Rough department geography label.
-
-The tokenizer creates region labels from available location fields, prioritizing:
-
-department_County -> department_City -> department_PostalCode
-
-Examples:
-
-- COUNTY_SHAWNEE
-- CITY_TOPEKA
-- ZIP_66604
-- UNKNOWN
-
-Used for next-event WHERE / geography prediction.
-
-### group_code_ids
-
-Integer-coded GroupCode for each event.
-
-This is the broad diagnosis category.
-
-Used for next-event WHAT diagnosis-group prediction.
-
-### diagnosis_value_ids
-
-Integer-coded DiagnosisValue for each event.
-
-This is the detailed diagnosis value used to track patient condition/journey more specifically.
-
-Used for next-event WHAT detailed-diagnosis prediction.
-
-This is important for resource allocation because it gives a more specific clinical signal than GroupCode.
+Used for predicting when the next encounter is likely to happen.
 
 ---
 
-## Why DiagnosisValue is separate
+## Rolling SDOH latest-status streams
 
-DiagnosisValue is important, but it has many unique values.
+SDOH response events are not sequence steps in the final artifact. Instead, each SDOH domain becomes a rolling latest-status stream.
 
-Current build metadata:
+Example fields:
 
-- group_code_classes: 1,634
-- diagnosis_value_classes: 21,141
+- sdoh_transportation_needs_latest_status_ids
+- sdoh_food_insecurity_latest_status_ids
+- sdoh_housing_stability_latest_status_ids
+- sdoh_financial_resource_strain_latest_status_ids
+- sdoh_utilities_latest_status_ids
+- sdoh_stress_latest_status_ids
+- sdoh_depression_latest_status_ids
+- sdoh_social_connections_latest_status_ids
+- sdoh_physical_activity_latest_status_ids
+- sdoh_alcohol_use_latest_status_ids
+- sdoh_intimate_partner_violence_latest_status_ids
 
-Putting DiagnosisValue directly inside event_token_ids would make the event vocabulary much larger and sparser.
+Each SDOH status stream is an encounter-level list aligned with the encounter sequence.
 
-So the design is:
+The value at position i means:
 
-event_token_ids = broad event state using GroupCode
+latest known status for that SDOH domain at or before encounter i
 
-diagnosis_value_ids = detailed diagnosis stream
+The status mapping is:
 
-This preserves detailed diagnosis information without making the main event token too sparse.
+- 0 = UNKNOWN_NOT_YET_MEASURED
+- 1 = NEGATIVE_NO_NEED
+- 2 = POSITIVE_NEED_OR_RISK
+- 3 = OTHER_DECLINED_UNABLE_UNSPECIFIED
+
+Example:
+
+sdoh_transportation_needs_latest_status_ids = [0, 2, 2, 2]
+
+means:
+
+- encounter 1: transportation status not known yet
+- encounter 2: transportation need/risk observed
+- encounter 3: latest known status remains positive
+- encounter 4: latest known status remains positive
+
+Example:
+
+sdoh_food_insecurity_latest_status_ids = [0, 0, 0, 2]
+
+means:
+
+- encounters 1-3: food insecurity not known yet
+- encounter 4: food insecurity need/risk observed
+
+This design avoids future leakage because the value at each encounter uses only information known at or before that encounter.
 
 ---
 
-## Patient-level vs journey-level
+## Static patient context
 
-Current design:
+### patient_context_ids
 
-one patient -> one full event sequence
+patient_context_ids contains one categorical ID per patient-level context field.
 
-Not current design:
+Example:
 
-one patient + one DiagnosisValue -> one journey sequence
+{
+"PatientBirthYearBin": 12,
+"SexAssignedAtBirth": 2,
+"OmbRace": 4,
+"OmbEthnicity": 1,
+"SmokingStatus": 3,
+"MaritalStatus": 2
+}
 
-Reason: our goal is to predict the patient's next visit/event overall. A patient may have multiple active diagnosis journeys, and cross-journey context can matter.
+These are static patient-level conditioning features, not event-level lists.
 
----
+Typical fields may include:
+
+- PatientBirthYearBin
+- SexAssignedAtBirth
+- OmbRace
+- OmbEthnicity
+- MaritalStatus
+- SmokingStatus
+- VitalStatus
+- MyChartStatus
+- SexualOrientation
+- patient_geography_known_flag
+- patient_block_population_bin
+
+Some SDOH summary fields may also exist in earlier artifacts, but the preferred final SDOH representation is the rolling latest-status streams.
+
+### patient_context_values
+
+patient_context_values contains numeric or raw patient-level geographic context.
+
+Example:
+
+{
+"patient_lat": 39.05,
+"patient_lon": -95.67,
+"patient_population": 1320.0,
+"CensusBlockGroupFipsCode": "201770045001"
+}
+
+Important interpretation:
+
+- patient_lat is the latitude of the centroid of the patient's Census block group, not exact home latitude.
+- patient_lon is the longitude of the centroid of the patient's Census block group, not exact home longitude.
+- patient_population is the Census population count of the patient's home Census block group.
+- CensusBlockGroupFipsCode is the patient's Census block group identifier. It is stored as a string, not as a numeric continuous feature.
 
 ## Model target interpretation
 
-The model is autoregressive.
+The model should be autoregressive over encounter positions.
 
-For a patient with:
+For each patient, at each timestep, the model uses previous encounters and context to predict the next encounter's:
 
-event_token_ids = [42, 91, 17]
+WHAT:
 
-The model receives:
+- type_ids
+- event_description_ids
+- group_code_ids
+- diagnosis_value_ids
 
-input_ids = [BOS, 42, 91]
+WHERE:
 
-and predicts:
+- setting_ids
+- dept_type_ids
+- dept_specialty_ids
+- facility_size_ids
+- region_ids
 
-target_event = [42, 91, 17]
+WHEN:
 
-So it learns:
+- gap_ids
 
-- given start -> predict event 1
-- given event 1 -> predict event 2
-- given event 2 -> predict event 3
+CONTEXT:
 
-At the same time, the model predicts aligned auxiliary targets:
+- rolling SDOH latest-status streams
+- static patient_context_ids
+- static patient_context_values
 
-- gap_ids -> WHEN
-- setting_ids -> WHERE care setting
-- dept_type_ids -> WHERE department type
-- facility_size_ids -> WHERE department volume/resource proxy
-- region_ids -> WHERE geography
-- group_code_ids -> WHAT broad diagnosis group
-- diagnosis_value_ids -> WHAT detailed diagnosis
-
----
-
-## Current build metadata
-
-The successful tokenization produced:
-
-n_events_processed: 11,883,143
-n_patients_seen: 363,271
-n_training_sequences: 319,094
-event_vocab_size: 136,482
-gap_classes: 9
-setting_classes: 8
-dept_type_classes: 9
-facility_size_classes: 7
-region_classes: 11
-group_code_classes: 1,634
-diagnosis_value_classes: 21,141
-diagnosis_patch_length_mismatch: 0
-
-The key validation point is:
-
-diagnosis_patch_length_mismatch = 0
-
-That means group_code_ids and diagnosis_value_ids aligned correctly with the patient event sequences.
+The model should no longer rely on event_token_ids, because the final artifact removes the grand composite event token.
 
 ---
 
@@ -332,19 +418,27 @@ That means group_code_ids and diagnosis_value_ids aligned correctly with the pat
 
 Use:
 
-patient_sequences_for_model_with_diagnosis.pt
+patient_sequences_encounter_only_with_sdoh_status_and_fips.pt
 
 The model should include heads for:
 
-- event token
+- type
+- event description
+- group code
+- diagnosis value
 - gap
 - setting
 - department type
-- facility size / department volume
+- department specialty
+- department volume / facility size proxy
 - region
-- group code
-- diagnosis value
+
+The model should also accept:
+
+- rolling SDOH latest-status streams as encounter-level covariates
+- patient_context_ids as static categorical covariates
+- patient_context_values as static numeric/raw geographic covariates
 
 This matches the project goal:
 
-Predict the next visit's WHAT, WHEN, and WHERE so resources and providers can be planned ahead.
+Predict the next clinical encounter's WHAT, WHEN, and WHERE so resources and providers can be planned ahead.
