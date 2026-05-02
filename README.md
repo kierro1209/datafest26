@@ -17,8 +17,8 @@ From the repo root:
 
 ```bash
 python modelling/train_patient_event_model.py \
-  --input modelling/token_sequence_model/patient_sequences_encounter_only_with_sdoh_status_and_fips.pt \
-  --vocab-json modelling/token_sequence_model/sequence_model_vocab_encounter_only_with_sdoh_status_and_fips.json \
+  --input token_sequence_model/patient_sequences_encounter_only_with_sdoh_status_and_fips.pt \
+  --vocab-json token_sequence_model/sequence_model_vocab_encounter_only_with_sdoh_status_and_fips.json \
   --output-dir data/processed/patient_event_model
 ```
 

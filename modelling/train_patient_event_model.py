@@ -722,8 +722,8 @@ def save_artifacts(output_dir: Path, prepared: PreparedData, model: nn.Module, h
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train a multi-task autoregressive patient event sequence model.")
-    p.add_argument("--input", type=Path, default=Path("modelling/token_sequence_model/patient_sequences_encounter_only_with_sdoh_status_and_fips.pt"))
-    p.add_argument("--vocab-json", type=Path, default=Path("modelling/token_sequence_model/sequence_model_vocab_encounter_only_with_sdoh_status_and_fips.json"))
+    p.add_argument("--input", type=Path, default=Path("token_sequence_model/patient_sequences_encounter_only_with_sdoh_status_and_fips.pt"))
+    p.add_argument("--vocab-json", type=Path, default=Path("token_sequence_model/sequence_model_vocab_encounter_only_with_sdoh_status_and_fips.json"))
     p.add_argument("--output-dir", type=Path, default=Path("data/processed/patient_event_model"))
     p.add_argument("--backbone", choices=["transformer", "gru", "lstm"], default="transformer")
     p.add_argument("--d-model", type=int, default=128)
