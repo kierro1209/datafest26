@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import logging
 import time
+import textwrap
 from pathlib import Path
 
 import numpy as np
@@ -296,6 +297,7 @@ def plot_survival_style_returns(eda: pd.DataFrame, out: Path, top_n: int = 10) -
             row[f"pct_within_{h}d"] = float((rows <= h).mean()) if len(rows) else np.nan
         rates.append(row)
     rate_df = pd.DataFrame(rates)
+    rate_df["GroupName_disp"] = rate_df["GroupName_disp"].apply(lambda x: str(x).split(",")[0])
 
     fig, ax = plt.subplots(figsize=(10, 5))
     x = np.arange(len(rate_df))
@@ -307,7 +309,11 @@ def plot_survival_style_returns(eda: pd.DataFrame, out: Path, top_n: int = 10) -
     ax.set_xticklabels(rate_df["GroupName_disp"], rotation=35, ha="right")
     ax.set_ylabel("Share of encounters")
     ax.set_title("Short-horizon return rates by diagnosis group (top by volume)")
-    ax.legend(title="Return window")
+    ax.legend(
+        title="Return window",
+        loc="center right",
+        bbox_to_anchor=(-0.25, 0.5)
+    )
     ax.set_ylim(0, 1)
     fig.tight_layout()
     fig.savefig(out, dpi=150)
