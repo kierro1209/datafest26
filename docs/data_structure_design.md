@@ -1,734 +1,2051 @@
-# DataFest 2026 Data Structure Design
-
-Generated: 2026-05-02  
-Status: **schema-synced to the explicit column lists supplied by the team**
+# Data Structure Design Summary
 
 ## Purpose
 
-This file proposes a robust, analysis-ready data structure for modeling patient journeys. It is built around an interpretable pipeline:
+This data structure converts the raw DataFest CSV files into a layered patient-journey dataset.
+
+The design is centered on `encounters.csv`, because each encounter is the core event in the patient timeline. Other CSVs add patient demographics, diagnosis details, department metadata, provider metadata, social determinant responses, and geography.
+
+The final goal is to support:
+
+- patient journey construction
+- encounter-level analysis
+- diagnosis-centered longitudinal analysis
+- social determinant analysis
+- sequence/token modeling
+- transition/pathway analysis
+- patient-level and diagnosis-level summaries
+
+The overall pipeline is:
 
 ```text
-raw CSVs → staging/validation layer → enriched encounter layer → SDOH aggregate layer → journey episode layer → sequence/token layer → modeling/story tables
+Raw CSVs
+→ cleaned dimension and fact tables
+→ encounter-level analytic table
+→ SDOH encounter summary
+→ patient-diagnosis journey table
+→ journey event sequence table
+→ journey transition table
+→ patient, diagnosis, and modeling summaries
 ```
 
-The design separates documented source fields from derived modeling choices. Raw/staging tables should preserve exact source column names. Derived marts may use snake_case aliases, but every alias must map back to one exact source column.
+---
 
-## Non-negotiable schema rule
+# 1. Raw input tables
 
-Do not guess or invent source column names. Use only the exact source columns below.
-
-### Exact source columns
-
-| CSV | Exact columns |
-|---|---|
-| `departments.csv` | `DepartmentKey`, `Address`, `City`, `County`, `DepartmentName`, `DepartmentSpecialty`, `DepartmentType`, `PostalCode`, `CensusTract` |
-| `diagnosis.csv` | `DiagnosisKey`, `GroupName`, `GroupCode`, `DiagnosisName`, `DiagnosisValue` |
-| `encounters.csv` | `Date`, `AdmissionInstant`, `AdmitYear`, `AdmitMonth`, `AdmitDay`, `AdmitHour`, `AdmitMinute`, `AdmissionSource`, `AdmissionType`, `DischargeInstant`, `DischargeYear`, `DischargeMonth`, `DischargeDay`, `DischargeHour`, `DischargeMinute`, `EncounterKey`, `PatientDurableKey`, `Type`, `VisitType`, `VisitTypeDescription`, `ProviderDurableKey`, `AttendingProviderDurableKey`, `DischargeProviderDurableKey`, `DepartmentKey`, `PrimaryDiagnosisKey`, `IsEdVisit`, `IsHospitalAdmission`, `IsHospitalOutpatientVisit`, `IsInpatientAdmission`, `IsObservation`, `IsOutpatientFaceToFaceVisit` |
-| `patients.csv` | `CensusBlockGroupFipsCode`, `DurableKey`, `FirstRace`, `MaritalStatus`, `MyChartStatus`, `OmbEthnicity`, `OmbRace`, `SexAssignedAtBirth`, `SexualOrientation`, `SmokingStatus`, `VitalStatus`, `PatientBirthYearBin` |
-| `providers.csv` | `DurableKey`, `ClinicianTitle`, `OfficeAddress`, `OfficeCity`, `OfficePostalCode`, `PrimaryDepartment`, `PrimarySpecialty`, `Type` |
-| `social_determinants.csv` | `DisplayName`, `AnswerText`, `EncounterKey`, `PatientDurableKey`, `Domain` |
-| `tigercensuscodes.csv` | `GEOID`, `PopulationValue`, `CENTLAT`, `CENTLON` |
-
-## Ground rules
-
-1. Treat `encounters.csv` as the event spine.
-2. Treat patient journeys as observed sequences, not necessarily complete real-world journeys.
-3. Use `encounters.PrimaryDiagnosisKey` only as a diagnosis join key.
-4. Use `diagnosis.DiagnosisValue` or `diagnosis.DiagnosisName` to define diagnosis-centered journeys.
-5. Preserve missingness semantics, especially starred values such as `*Unspecified` or `*Unknown`.
-6. Keep raw keys in every derived table for auditability.
-7. Keep every token reversible to source fields.
-8. Aggregate `social_determinants.csv` before joining it into one-row-per-encounter marts.
-9. Do not rename raw/staging source columns; rename only in derived marts with an explicit source map.
-
-## High-level architecture
-
-```mermaid
-flowchart TD
-    A[Raw CSVs with exact source columns] --> B[Staging + schema validation]
-    B --> C[Normalized relational validation]
-    C --> D[Encounter-enriched mart]
-    C --> E[Encounter-level SDOH aggregate]
-    D --> F[Journey episode mart]
-    E --> F
-    F --> G[Journey event token table]
-    G --> H[Journey feature matrix]
-    G --> I[Sequence models / motifs / Sankey edges]
-    H --> J[Clustering / archetypes / gap analysis]
-```
-
-## Layer 0: raw immutable layer
-
-Store raw files without modification:
+The raw CSV files are:
 
 ```text
-data/raw/encounters.csv
-data/raw/patients.csv
-data/raw/diagnosis.csv
-data/raw/departments.csv
-data/raw/providers.csv
-data/raw/social_determinants.csv
-data/raw/tigercensuscodes.csv
+departments.csv
+diagnosis.csv
+encounters.csv
+patients.csv
+providers.csv
+social_determinants.csv
+tigercensuscodes.csv
 ```
 
-Rules:
+Use only the documented column names below.
 
-- Never overwrite raw files.
-- Read keys as strings where possible to avoid losing formatting.
-- Store load logs: row counts, exact column names, schema, missingness summaries, and hash/checksum if allowed by team workflow.
-- Fail fast if the loaded column names do not exactly match the schema in this document.
+---
 
-## Layer 1: staging and schema validation
-
-Create lightly cleaned staging views/tables that preserve exact source column names:
+## 1.1 `departments.csv`
 
 ```text
-stg_encounters
-stg_patients
-stg_diagnosis
-stg_departments
-stg_providers
-stg_social_determinants
-stg_tigercensuscodes
+DepartmentKey
+Address
+City
+County
+DepartmentName
+DepartmentSpecialty
+DepartmentType
+PostalCode
+CensusTract
 ```
 
-Recommended staging tasks:
-
-- Trim whitespace from string fields.
-- Parse date/time fields into additional helper columns while keeping original fields.
-- Normalize missing-like labels into additional helper columns rather than overwriting the original values.
-- Validate uniqueness of documented primary identifiers.
-- Validate foreign-key coverage and report unmatched values.
-
-### Required schema validation checks
-
-| Table | Required exact columns |
-|---|---|
-| `stg_departments` | `DepartmentKey`, `Address`, `City`, `County`, `DepartmentName`, `DepartmentSpecialty`, `DepartmentType`, `PostalCode`, `CensusTract` |
-| `stg_diagnosis` | `DiagnosisKey`, `GroupName`, `GroupCode`, `DiagnosisName`, `DiagnosisValue` |
-| `stg_encounters` | all 31 exact `encounters.csv` columns listed above |
-| `stg_patients` | all 12 exact `patients.csv` columns listed above |
-| `stg_providers` | all 8 exact `providers.csv` columns listed above |
-| `stg_social_determinants` | `DisplayName`, `AnswerText`, `EncounterKey`, `PatientDurableKey`, `Domain` |
-| `stg_tigercensuscodes` | `GEOID`, `PopulationValue`, `CENTLAT`, `CENTLON` |
-
-### Missingness helper design
-
-Do not overwrite raw values. Add helper columns in derived/staging layers only:
-
-| Helper column pattern | Description |
-|---|---|
-| `{field}_clean` | Trimmed/standardized version of the source field. |
-| `{field}_missing_class` | One of `observed`, `asked_not_answered_or_unable`, `not_recorded_or_unknown`, `structural_not_applicable`, `system_missing`, `other_missing_like`. |
-
-Suggested missingness classes:
-
-| Raw pattern | Class |
-|---|---|
-| `*Unspecified`, `*Unknown` | `asked_not_answered_or_unable` |
-| `Unspecified`, `Unknown` | `not_recorded_or_unknown` |
-| `*Not Applicable`, `Not Applicable` | `structural_not_applicable` |
-| blank / null / `NA` | `system_missing` |
-| everything else | `observed` |
-
-## Layer 2: relational validation layer
-
-Before making any modeling table, run join checks using exact source columns.
-
-### Core joins
-
-| Relationship | Exact join |
-|---|---|
-| encounters → patients | `encounters.PatientDurableKey = patients.DurableKey` |
-| encounters → diagnosis | `encounters.PrimaryDiagnosisKey = diagnosis.DiagnosisKey` |
-| encounters → departments | `encounters.DepartmentKey = departments.DepartmentKey` |
-| encounters → provider role | `encounters.ProviderDurableKey = providers.DurableKey` |
-| encounters → attending provider role | `encounters.AttendingProviderDurableKey = providers.DurableKey` |
-| encounters → discharge provider role | `encounters.DischargeProviderDurableKey = providers.DurableKey` |
-| encounters → social determinants | `encounters.EncounterKey = social_determinants.EncounterKey` |
-| patients → social determinants | `patients.DurableKey = social_determinants.PatientDurableKey` |
-| patients → Census block group | `patients.CensusBlockGroupFipsCode = tigercensuscodes.GEOID` |
-
-### Validation outputs
-
-Create a small QC table or report with:
+Primary key:
 
 ```text
-qc_table_name
-qc_check_name
-n_rows_checked
-n_pass
-n_fail
-pct_fail
-example_values_or_counts
-notes
+DepartmentKey
 ```
 
-Minimum QC checks:
-
-- Uniqueness of `EncounterKey`, `DurableKey`, `DiagnosisKey`, `DepartmentKey`, provider `DurableKey`, and `GEOID` in their respective tables.
-- Count `encounters.PrimaryDiagnosisKey = -1` separately.
-- Count unmatched diagnosis keys, excluding/flagging `-1`.
-- Count unmatched department keys.
-- Count unmatched provider keys separately for `ProviderDurableKey`, `AttendingProviderDurableKey`, and `DischargeProviderDurableKey`.
-- Count unmatched patient geography keys, separating suppressed/unknown/missing values.
-- Validate `social_determinants.PatientDurableKey == encounters.PatientDurableKey` after joining on `EncounterKey`.
-
-## Layer 3: encounter-enriched mart
-
-Name:
+Linked from:
 
 ```text
-mart_encounter_enriched
+encounters.DepartmentKey
 ```
+
+---
+
+## 1.2 `diagnosis.csv`
+
+```text
+DiagnosisKey
+GroupName
+GroupCode
+DiagnosisName
+DiagnosisValue
+```
+
+Primary key:
+
+```text
+DiagnosisKey
+```
+
+Linked from:
+
+```text
+encounters.PrimaryDiagnosisKey
+```
+
+Important analytic note:
+
+```text
+PrimaryDiagnosisKey is used for joining.
+DiagnosisValue is preferred for defining longitudinal patient journeys.
+GroupCode and GroupName are useful for broader diagnosis grouping.
+```
+
+---
+
+## 1.3 `encounters.csv`
+
+```text
+Date
+AdmissionInstant
+AdmitYear
+AdmitMonth
+AdmitDay
+AdmitHour
+AdmitMinute
+AdmissionSource
+AdmissionType
+DischargeInstant
+DischargeYear
+DischargeMonth
+DischargeDay
+DischargeHour
+DischargeMinute
+EncounterKey
+PatientDurableKey
+Type
+VisitType
+VisitTypeDescription
+ProviderDurableKey
+AttendingProviderDurableKey
+DischargeProviderDurableKey
+DepartmentKey
+PrimaryDiagnosisKey
+IsEdVisit
+IsHospitalAdmission
+IsHospitalOutpatientVisit
+IsInpatientAdmission
+IsObservation
+IsOutpatientFaceToFaceVisit
+```
+
+Primary key:
+
+```text
+EncounterKey
+```
+
+Foreign keys:
+
+```text
+PatientDurableKey
+→ patients.DurableKey
+
+PrimaryDiagnosisKey
+→ diagnosis.DiagnosisKey
+
+DepartmentKey
+→ departments.DepartmentKey
+
+ProviderDurableKey
+→ providers.DurableKey
+
+AttendingProviderDurableKey
+→ providers.DurableKey
+
+DischargeProviderDurableKey
+→ providers.DurableKey
+```
+
+Role in design:
+
+```text
+encounters.csv is the central event table.
+Each row is one encounter.
+Patient journeys are generated by sequencing encounters over time.
+```
+
+---
+
+## 1.4 `patients.csv`
+
+```text
+CensusBlockGroupFipsCode
+DurableKey
+FirstRace
+MaritalStatus
+MyChartStatus
+OmbEthnicity
+OmbRace
+SexAssignedAtBirth
+SexualOrientation
+SmokingStatus
+VitalStatus
+PatientBirthYearBin
+```
+
+Primary key:
+
+```text
+DurableKey
+```
+
+Linked from:
+
+```text
+encounters.PatientDurableKey
+social_determinants.PatientDurableKey
+```
+
+Geography link:
+
+```text
+CensusBlockGroupFipsCode
+→ tigercensuscodes.GEOID
+```
+
+---
+
+## 1.5 `providers.csv`
+
+```text
+DurableKey
+ClinicianTitle
+OfficeAddress
+OfficeCity
+OfficePostalCode
+PrimaryDepartment
+PrimarySpecialty
+Type
+```
+
+Primary key:
+
+```text
+DurableKey
+```
+
+Linked from:
+
+```text
+encounters.ProviderDurableKey
+encounters.AttendingProviderDurableKey
+encounters.DischargeProviderDurableKey
+```
+
+Important note:
+
+```text
+providers.DurableKey is a provider key.
+patients.DurableKey is a patient key.
+They share the same column name but represent different entities.
+Do not join providers.DurableKey to patients.DurableKey.
+```
+
+---
+
+## 1.6 `social_determinants.csv`
+
+```text
+DisplayName
+AnswerText
+EncounterKey
+PatientDurableKey
+Domain
+```
+
+Composite relationship keys:
+
+```text
+EncounterKey
+→ encounters.EncounterKey
+
+PatientDurableKey
+→ patients.DurableKey
+```
+
+Role in design:
+
+```text
+Each row is one answered social determinant question during an encounter.
+One encounter may have zero, one, or many SDOH response rows.
+```
+
+---
+
+## 1.7 `tigercensuscodes.csv`
+
+```text
+GEOID
+PopulationValue
+CENTLAT
+CENTLON
+```
+
+Primary key:
+
+```text
+GEOID
+```
+
+Linked from:
+
+```text
+patients.CensusBlockGroupFipsCode
+```
+
+Role in design:
+
+```text
+Provides geography and population metadata for patient census block groups.
+```
+
+---
+
+# 2. Final table design
+
+The final structure has three levels:
+
+```text
+Level 1: Cleaned dimensions and facts
+Level 2: Encounter and SDOH analytic tables
+Level 3: Journey, sequence, transition, and modeling tables
+```
+
+---
+
+# 3. Level 1: Cleaned dimensions and facts
+
+These tables mostly preserve the raw CSV structure but standardize names, types, missingness, and keys.
+
+---
+
+## 3.1 `dim_patient`
 
 Unit of observation:
 
 ```text
-one row = one encounter
+one row per patient
+```
+
+Generated from:
+
+```text
+patients.csv
+```
+
+Columns carried forward:
+
+```text
+DurableKey
+CensusBlockGroupFipsCode
+FirstRace
+MaritalStatus
+MyChartStatus
+OmbEthnicity
+OmbRace
+SexAssignedAtBirth
+SexualOrientation
+SmokingStatus
+VitalStatus
+PatientBirthYearBin
+```
+
+Generation logic:
+
+```text
+patients.csv
+→ preserve DurableKey as patient identifier
+→ preserve CensusBlockGroupFipsCode for geography joins
+→ standardize missing-value labels
+→ optionally create missingness flags
+→ output dim_patient
+```
+
+Suggested additional derived fields:
+
+```text
+patient_geography_known_flag
+patient_birth_year_bin_missing_flag
+mychart_status_missing_flag
+smoking_status_missing_flag
 ```
 
 Purpose:
 
-This is the main table for descriptive summaries, journey construction, and tokenization.
-
-### Identity and raw keys
-
-| Derived column | Exact source column | Notes |
-|---|---|---|
-| `encounter_key` | `encounters.EncounterKey` | Primary encounter identifier. |
-| `patient_key` | `encounters.PatientDurableKey` | Patient identifier used for encounter ownership. |
-| `patient_durable_key_from_patients` | `patients.DurableKey` | Joined patient key for validation/audit. |
-| `primary_diagnosis_key` | `encounters.PrimaryDiagnosisKey` | Join key to diagnosis. |
-| `department_key` | `encounters.DepartmentKey` | Join key to departments. |
-| `provider_durable_key` | `encounters.ProviderDurableKey` | General provider role. |
-| `attending_provider_durable_key` | `encounters.AttendingProviderDurableKey` | Attending provider role. |
-| `discharge_provider_durable_key` | `encounters.DischargeProviderDurableKey` | Discharge provider role. |
-
-### Time fields
-
-| Derived column | Exact source column / derivation | Notes |
-|---|---|---|
-| `encounter_date` | `encounters.Date` | Main encounter start date. |
-| `admission_instant` | `encounters.AdmissionInstant` | Admission datetime where relevant. |
-| `admit_year` | `encounters.AdmitYear` | Preserve exact source date split. |
-| `admit_month` | `encounters.AdmitMonth` | Preserve exact source date split. |
-| `admit_day` | `encounters.AdmitDay` | Preserve exact source date split. |
-| `admit_hour` | `encounters.AdmitHour` | Preserve exact source date split. |
-| `admit_minute` | `encounters.AdmitMinute` | Preserve exact source date split. |
-| `discharge_instant` | `encounters.DischargeInstant` | Discharge datetime where relevant. |
-| `discharge_year` | `encounters.DischargeYear` | Preserve exact source date split. |
-| `discharge_month` | `encounters.DischargeMonth` | Preserve exact source date split. |
-| `discharge_day` | `encounters.DischargeDay` | Preserve exact source date split. |
-| `discharge_hour` | `encounters.DischargeHour` | Preserve exact source date split. |
-| `discharge_minute` | `encounters.DischargeMinute` | Preserve exact source date split. |
-| `length_of_stay_hours` | derived from `AdmissionInstant`, `DischargeInstant` | Only where both parse as valid datetimes. |
-| `encounter_year` | derived from `Date` | For trend/seasonality. |
-| `encounter_month` | derived from `Date` | For trend/seasonality. |
-
-### Encounter classification
-
-| Derived column | Exact source column | Notes |
-|---|---|---|
-| `encounter_type` | `encounters.Type` | High-level encounter category. |
-| `visit_type` | `encounters.VisitType` | Detailed visit type; high cardinality. |
-| `visit_type_description` | `encounters.VisitTypeDescription` | Middle-level visit type. |
-| `admission_source` | `encounters.AdmissionSource` | Mostly hospital-related. |
-| `admission_type` | `encounters.AdmissionType` | Useful for urgency/context. |
-| `is_ed_visit` | `encounters.IsEdVisit` | Flag. |
-| `is_hospital_admission` | `encounters.IsHospitalAdmission` | Flag. |
-| `is_hospital_outpatient_visit` | `encounters.IsHospitalOutpatientVisit` | Flag. |
-| `is_inpatient_admission` | `encounters.IsInpatientAdmission` | Flag. |
-| `is_observation` | `encounters.IsObservation` | Flag. |
-| `is_outpatient_face_to_face_visit` | `encounters.IsOutpatientFaceToFaceVisit` | Flag. |
-
-### Diagnosis enrichment
-
-| Derived column | Exact source column | Notes |
-|---|---|---|
-| `diagnosis_key` | `diagnosis.DiagnosisKey` | Joined key. |
-| `diagnosis_value` | `diagnosis.DiagnosisValue` | Recommended journey identifier. |
-| `diagnosis_name` | `diagnosis.DiagnosisName` | Specific diagnosis text. |
-| `diagnosis_group_code` | `diagnosis.GroupCode` | Broad diagnosis family. |
-| `diagnosis_group_name` | `diagnosis.GroupName` | Broad diagnosis description. |
-| `has_documented_primary_diagnosis` | derived from `encounters.PrimaryDiagnosisKey` and diagnosis join status | False when `PrimaryDiagnosisKey = -1` or join missing. |
-
-### Department enrichment
-
-| Derived column | Exact source column | Notes |
-|---|---|---|
-| `department_name` | `departments.DepartmentName` | Exact source has no space. |
-| `department_specialty` | `departments.DepartmentSpecialty` | Useful for care-type tokens. |
-| `department_type` | `departments.DepartmentType` | Useful for high-level care setting. |
-| `department_address` | `departments.Address` | Department location. |
-| `department_city` | `departments.City` | Department location. |
-| `department_county` | `departments.County` | Department location. |
-| `department_postal_code` | `departments.PostalCode` | Department location. |
-| `department_census_tract` | `departments.CensusTract` | Department geography. |
-
-### Provider enrichment
-
-Join `providers` three times using role-specific aliases.
-
-| Role | Exact encounter key | Exact provider key | Derived prefix |
-|---|---|---|---|
-| General provider | `encounters.ProviderDurableKey` | `providers.DurableKey` | `provider_*` |
-| Attending provider | `encounters.AttendingProviderDurableKey` | `providers.DurableKey` | `attending_provider_*` |
-| Discharge provider | `encounters.DischargeProviderDurableKey` | `providers.DurableKey` | `discharge_provider_*` |
-
-Suggested role-specific fields:
-
-| Derived column pattern | Exact source column | Notes |
-|---|---|---|
-| `{role}_type` | `providers.Type` | Higher-level provider type. |
-| `{role}_clinician_title` | `providers.ClinicianTitle` | Credential/title. |
-| `{role}_primary_specialty` | `providers.PrimarySpecialty` | Specialty. |
-| `{role}_primary_department` | `providers.PrimaryDepartment` | Home department. |
-| `{role}_office_address` | `providers.OfficeAddress` | Provider location. |
-| `{role}_office_city` | `providers.OfficeCity` | Provider location. |
-| `{role}_office_postal_code` | `providers.OfficePostalCode` | Provider location. |
-| `{role}_join_status` | derived | `matched`, `not_applicable`, `unspecified`, `unmatched_key`, etc. |
-
-### Patient enrichment
-
-| Derived column | Exact source column | Notes |
-|---|---|---|
-| `birth_year_bin` | `patients.PatientBirthYearBin` | Age proxy. |
-| `sex_assigned_at_birth` | `patients.SexAssignedAtBirth` | Preserve missing class. |
-| `first_race` | `patients.FirstRace` | Patient-provided first race. |
-| `omb_race` | `patients.OmbRace` | Federal reporting category. |
-| `omb_ethnicity` | `patients.OmbEthnicity` | Federal reporting category. |
-| `marital_status` | `patients.MaritalStatus` | Preserve missing class. |
-| `smoking_status` | `patients.SmokingStatus` | Last known status. |
-| `vital_status` | `patients.VitalStatus` | Vital status. |
-| `mychart_status` | `patients.MyChartStatus` | Engagement proxy. |
-| `sexual_orientation` | `patients.SexualOrientation` | Preserve missing class. |
-| `patient_census_block_group_fips_code` | `patients.CensusBlockGroupFipsCode` | Geography key. |
-
-### Geography enrichment
-
-| Derived column | Exact source column / derivation | Notes |
-|---|---|---|
-| `home_geoid` | `tigercensuscodes.GEOID` | Joined from `patients.CensusBlockGroupFipsCode`. |
-| `home_centlat` | `tigercensuscodes.CENTLAT` | Approximate home block group centroid latitude. |
-| `home_centlon` | `tigercensuscodes.CENTLON` | Approximate home block group centroid longitude. |
-| `home_population_value` | `tigercensuscodes.PopulationValue` | Census population count/value as supplied. |
-| `home_geo_status` | derived | `matched`, `suppressed_or_unknown`, `unmatched`, etc. |
-| `home_department_tract_match_possible` | derived | Whether comparison is possible. |
-
-## Layer 4: encounter-level social determinant feature table
-
-Name:
-
 ```text
-mart_encounter_sdoh
+Stores patient demographic, engagement, smoking, vital status, and geography-linking fields.
 ```
+
+---
+
+## 3.2 `dim_diagnosis`
 
 Unit of observation:
 
 ```text
-one row = one encounter with summarized SDOH data
+one row per diagnosis
 ```
 
-Why separate it:
-
-`social_determinants.csv` has one row per question-answer, so joining it directly to `encounters.csv` will duplicate encounter rows. Aggregate first, then join.
-
-### Base columns
-
-| Derived column | Exact source column / derivation | Notes |
-|---|---|---|
-| `encounter_key` | `social_determinants.EncounterKey` | Join to `encounters.EncounterKey`. |
-| `patient_key` | `social_determinants.PatientDurableKey` | Validate against `encounters.PatientDurableKey`. |
-| `sdoh_n_questions_answered` | count rows | Count SDOH rows for the encounter. |
-| `sdoh_n_domains_answered` | count distinct `Domain` | Count unique domains answered. |
-| `sdoh_domains_answered_list` | aggregate `Domain` | Optional audit/debug field. |
-| `sdoh_any_response` | derived | Boolean. |
-
-### Domain-level fields
-
-Use domain slugs created from exact `social_determinants.Domain` values.
+Generated from:
 
 ```text
-sdoh_{domain_slug}_n_questions
-sdoh_{domain_slug}_answers_json
-sdoh_{domain_slug}_observed_flag
-sdoh_{domain_slug}_missing_flag
-sdoh_{domain_slug}_risk_label      # only after validated mapping
+diagnosis.csv
 ```
 
-Important scoring rule:
-
-Do not assign positive/negative risk labels until actual `AnswerText` values are profiled and a domain-specific scoring rule is agreed. Before validation, use neutral tokens such as:
+Columns carried forward:
 
 ```text
-SDOH:{{domain_slug}}:{{question_slug}}:{{answer_slug}}
+DiagnosisKey
+GroupName
+GroupCode
+DiagnosisName
+DiagnosisValue
 ```
 
-Where:
-
-- `domain_slug` comes from `social_determinants.Domain`.
-- `question_slug` comes from `social_determinants.DisplayName`.
-- `answer_slug` comes from `social_determinants.AnswerText`.
-
-## Layer 5: journey episode table
-
-Name:
+Generation logic:
 
 ```text
-mart_journey_episode
+diagnosis.csv
+→ preserve DiagnosisKey for joins
+→ preserve DiagnosisValue for journey construction
+→ preserve GroupCode and GroupName for broader grouping
+→ output dim_diagnosis
 ```
+
+Purpose:
+
+```text
+Provides diagnosis labels and diagnosis hierarchy.
+```
+
+Important design rule:
+
+```text
+Use DiagnosisKey only as the join key.
+Use DiagnosisValue as the preferred patient-journey diagnosis identifier.
+Use GroupCode and GroupName for broader diagnosis families.
+```
+
+---
+
+## 3.3 `dim_department`
 
 Unit of observation:
 
 ```text
-one row = one observed patient-diagnosis journey or episode
+one row per department
 ```
 
-Default journey definition:
+Generated from:
 
 ```text
-patient_key + diagnosis_value
+departments.csv
 ```
 
-Exact source mapping:
+Columns carried forward:
 
 ```text
-patient_key      ← encounters.PatientDurableKey
-diagnosis_value  ← diagnosis.DiagnosisValue, joined through encounters.PrimaryDiagnosisKey = diagnosis.DiagnosisKey
+DepartmentKey
+Address
+City
+County
+DepartmentName
+DepartmentSpecialty
+DepartmentType
+PostalCode
+CensusTract
 ```
 
-Rationale:
-
-The documentation indicates that `DiagnosisValue` is more stable for tracking a condition over time than `PrimaryDiagnosisKey`.
-
-### Episode splitting
-
-Start with unsplit patient-diagnosis journeys, then test optional episode splitting by long inactive gaps.
-
-| Rule | Meaning | Use case |
-|---|---|---|
-| No split | All encounters for patient + `diagnosis.DiagnosisValue` are one observed journey. | Baseline. |
-| 180-day split | New episode after >180 days with no same-diagnosis encounter. | Better for acute conditions. |
-| 365-day split | New episode after >365 days with no same-diagnosis encounter. | Conservative split. |
-| Diagnosis-group journey | Use `diagnosis.GroupCode` instead of `diagnosis.DiagnosisValue`. | Broad disease-family analysis. |
-
-### Proposed columns
-
-| Derived column | Description |
-|---|---|
-| `journey_id` | Stable hash or concatenation of patient, diagnosis, and episode number. |
-| `patient_key` | From `encounters.PatientDurableKey`. |
-| `diagnosis_value` | From `diagnosis.DiagnosisValue`. |
-| `diagnosis_name_mode` | Most common `diagnosis.DiagnosisName` within journey, if useful. |
-| `diagnosis_group_code` | From `diagnosis.GroupCode`. |
-| `diagnosis_group_name` | From `diagnosis.GroupName`. |
-| `episode_number` | 1, 2, 3... if splitting is used. |
-| `first_observed_encounter_key` | First `encounters.EncounterKey` in observed journey. |
-| `last_observed_encounter_key` | Last `encounters.EncounterKey` in observed journey. |
-| `first_observed_date` | First `encounters.Date` in observed journey. |
-| `last_observed_date` | Last `encounters.Date` in observed journey. |
-| `duration_days_observed` | Last minus first date. |
-| `n_encounters` | Count of encounters. |
-| `n_unique_visit_dates` | Count of distinct `encounters.Date`. |
-| `n_departments` | Count of unique `encounters.DepartmentKey`. |
-| `n_department_types` | Count of unique `departments.DepartmentType`. |
-| `n_provider_types` | Count of unique joined `providers.Type` for selected provider role(s). |
-| `n_ed_visits` | Sum/count of `encounters.IsEdVisit`. |
-| `n_hospital_admissions` | Sum/count of `encounters.IsHospitalAdmission`. |
-| `n_inpatient_admissions` | Sum/count of `encounters.IsInpatientAdmission`. |
-| `n_observation_encounters` | Sum/count of `encounters.IsObservation`. |
-| `n_outpatient_face_to_face_visits` | Sum/count of `encounters.IsOutpatientFaceToFaceVisit`. |
-| `first_department_type` | First observed `departments.DepartmentType`. |
-| `last_department_type` | Last observed `departments.DepartmentType`. |
-| `max_gap_days` | Longest gap between consecutive same-journey encounters. |
-| `median_gap_days` | Median gap. |
-| `first_to_second_gap_days` | Gap from first to second encounter; null for singletons. |
-| `has_30d_followup` | Whether another same-journey encounter occurs within 30 days of first event or selected index event. |
-| `has_90d_followup` | Same for 90 days. |
-| `observed_start_censored_flag` | True if first observed event is near start of dataset window or otherwise likely left-censored. |
-| `observed_end_censored_flag` | True if last observed event is near end of dataset window or otherwise likely right-censored. |
-| `sdoh_any_prior_or_during` | Whether SDOH info exists at or before journey start/during journey. |
-| `sdoh_domain_summary_json` | Compact summary of observed SDOH domains. |
-
-### Censoring flags
-
-Because the dataset window may miss the beginning or end of real-world journeys, keep censoring flags in every journey summary. Example conservative definitions:
+Generation logic:
 
 ```text
-observed_start_censored_flag = first_observed_date <= dataset_start + 30 days
-observed_end_censored_flag   = last_observed_date >= dataset_end - 30 days
+departments.csv
+→ preserve DepartmentKey
+→ standardize text fields
+→ preserve DepartmentType and DepartmentSpecialty
+→ preserve geography/location fields
+→ output dim_department
 ```
 
-These thresholds are modeling choices and should be tuned or sensitivity-tested.
-
-## Layer 6: sequence/token table
-
-Name:
+Purpose:
 
 ```text
-mart_journey_event_token
+Adds care-location, department type, specialty, county, postal code, and census tract metadata to encounters.
 ```
+
+---
+
+## 3.4 `dim_provider`
 
 Unit of observation:
 
 ```text
-one row = one ordered encounter-token event within one journey
+one row per provider
 ```
 
-### Base columns
-
-| Derived column | Source / derivation |
-|---|---|
-| `journey_id` | From `mart_journey_episode`. |
-| `patient_key` | From `encounters.PatientDurableKey`. |
-| `event_index` | 1-based position within journey. |
-| `encounter_key` | From `encounters.EncounterKey`. |
-| `event_date` | From `encounters.Date`. |
-| `days_since_prior_event` | Difference from previous same-journey `event_date`. |
-| `gap_bin` | Categorical gap token. |
-| `token_string` | Full interpretable token. |
-| `token_version` | Version of token recipe. |
-| `token_components_json` | Machine-readable components for reversibility. |
-
-### Recommended token components
-
-| Component | Exact source / derivation | Example pattern |
-|---|---|---|
-| Time gap | Derived from prior same-journey event | `GAP:1_7D` |
-| Encounter type | `encounters.Type` | `TYPE:<value>` |
-| Visit description | `encounters.VisitTypeDescription` | `VTD:<value>` |
-| Department type | `departments.DepartmentType` | `DEPT_TYPE:<value>` |
-| Department specialty | `departments.DepartmentSpecialty` | `DEPT_SPEC:<value>` |
-| Diagnosis group | `diagnosis.GroupCode` | `DXG:<value>` |
-| Diagnosis value | `diagnosis.DiagnosisValue` | `DX:<value>` |
-| Setting flags | `encounters.IsEdVisit`, `encounters.IsHospitalAdmission`, `encounters.IsHospitalOutpatientVisit`, `encounters.IsInpatientAdmission`, `encounters.IsObservation`, `encounters.IsOutpatientFaceToFaceVisit` | `SETTING:<bundle>` |
-| Provider type | role-specific `providers.Type` | `PROV:<value>` |
-| SDOH summary | Aggregated from `social_determinants.Domain`, `DisplayName`, `AnswerText` | `SDOH:<bundle>` |
-
-### Initial gap bins
-
-| Bin | Rule |
-|---|---|
-| `GAP:START` | First event in journey. |
-| `GAP:0D` | Same calendar date as previous event. |
-| `GAP:1_7D` | 1–7 days. |
-| `GAP:8_30D` | 8–30 days. |
-| `GAP:31_90D` | 31–90 days. |
-| `GAP:91_180D` | 91–180 days. |
-| `GAP:181_365D` | 181–365 days. |
-| `GAP:365PLUS` | More than 365 days. |
-
-### Token v1 template
+Generated from:
 
 ```text
-{{gap_bin}}|TYPE:{{encounter_type}}|VTD:{{visit_type_description}}|DEPT:{{department_type}}|DXG:{{diagnosis_group_code}}|SETTING:{{setting_bundle}}|SDOH:{{sdoh_bundle}}
+providers.csv
 ```
 
-Example with placeholders only:
+Columns carried forward:
 
 ```text
-GAP:1_7D|TYPE:<encounters.Type>|VTD:<encounters.VisitTypeDescription>|DEPT:<departments.DepartmentType>|DXG:<diagnosis.GroupCode>|SETTING:<encounter_flags>|SDOH:<domain_summary>
+DurableKey
+ClinicianTitle
+OfficeAddress
+OfficeCity
+OfficePostalCode
+PrimaryDepartment
+PrimarySpecialty
+Type
 ```
 
-Design principle:
-
-Keep token v1 compact. Use `token_components_json` to preserve more detail without exploding the vocabulary.
-
-## Layer 7: journey feature matrix
-
-Name:
+Generation logic:
 
 ```text
-model_journey_features
+providers.csv
+→ preserve DurableKey as provider identifier
+→ standardize ClinicianTitle, Type, and PrimarySpecialty
+→ preserve office location fields
+→ output dim_provider
 ```
+
+Purpose:
+
+```text
+Adds provider role metadata to encounters.
+```
+
+Provider-role joins:
+
+```text
+encounters.ProviderDurableKey
+→ dim_provider.DurableKey
+
+encounters.AttendingProviderDurableKey
+→ dim_provider.DurableKey
+
+encounters.DischargeProviderDurableKey
+→ dim_provider.DurableKey
+```
+
+Recommended role-specific output fields in enriched tables:
+
+```text
+provider_ClinicianTitle
+provider_PrimarySpecialty
+provider_Type
+
+attending_provider_ClinicianTitle
+attending_provider_PrimarySpecialty
+attending_provider_Type
+
+discharge_provider_ClinicianTitle
+discharge_provider_PrimarySpecialty
+discharge_provider_Type
+```
+
+---
+
+## 3.5 `dim_geography`
 
 Unit of observation:
 
 ```text
-one row = one journey_id
+one row per census block group
 ```
 
-### Feature families
-
-#### Volume and duration
+Generated from:
 
 ```text
+tigercensuscodes.csv
+```
+
+Columns carried forward:
+
+```text
+GEOID
+PopulationValue
+CENTLAT
+CENTLON
+```
+
+Generation logic:
+
+```text
+tigercensuscodes.csv
+→ preserve GEOID
+→ preserve PopulationValue
+→ preserve CENTLAT and CENTLON
+→ optionally create population bins
+→ output dim_geography
+```
+
+Purpose:
+
+```text
+Adds patient home geography and block-group population context.
+```
+
+Join path:
+
+```text
+dim_patient.CensusBlockGroupFipsCode
+→ dim_geography.GEOID
+```
+
+Suggested derived fields:
+
+```text
+patient_block_population_bin
+patient_home_lat
+patient_home_lon
+patient_geography_known_flag
+```
+
+---
+
+## 3.6 `fact_encounter_base`
+
+Unit of observation:
+
+```text
+one row per encounter
+```
+
+Generated from:
+
+```text
+encounters.csv
+```
+
+Columns carried forward:
+
+```text
+Date
+AdmissionInstant
+AdmitYear
+AdmitMonth
+AdmitDay
+AdmitHour
+AdmitMinute
+AdmissionSource
+AdmissionType
+DischargeInstant
+DischargeYear
+DischargeMonth
+DischargeDay
+DischargeHour
+DischargeMinute
+EncounterKey
+PatientDurableKey
+Type
+VisitType
+VisitTypeDescription
+ProviderDurableKey
+AttendingProviderDurableKey
+DischargeProviderDurableKey
+DepartmentKey
+PrimaryDiagnosisKey
+IsEdVisit
+IsHospitalAdmission
+IsHospitalOutpatientVisit
+IsInpatientAdmission
+IsObservation
+IsOutpatientFaceToFaceVisit
+```
+
+Generation logic:
+
+```text
+encounters.csv
+→ parse Date
+→ parse AdmissionInstant if available
+→ parse DischargeInstant if available
+→ preserve EncounterKey as encounter identifier
+→ preserve PatientDurableKey as patient link
+→ preserve PrimaryDiagnosisKey as diagnosis join key
+→ preserve DepartmentKey as department join key
+→ preserve all provider-role keys
+→ preserve encounter type and visit type fields
+→ preserve care-setting flags
+→ standardize missing-value labels
+→ output fact_encounter_base
+```
+
+Purpose:
+
+```text
+This is the central event spine for the full data structure.
+```
+
+---
+
+## 3.7 `fact_sdoh_response`
+
+Unit of observation:
+
+```text
+one row per answered SDOH question during an encounter
+```
+
+Generated from:
+
+```text
+social_determinants.csv
+```
+
+Columns carried forward:
+
+```text
+DisplayName
+AnswerText
+EncounterKey
+PatientDurableKey
+Domain
+```
+
+Generation logic:
+
+```text
+social_determinants.csv
+→ preserve EncounterKey
+→ preserve PatientDurableKey
+→ standardize Domain
+→ standardize DisplayName
+→ standardize AnswerText
+→ optionally create a stable question label from DisplayName
+→ output fact_sdoh_response
+```
+
+Purpose:
+
+```text
+Keeps SDOH responses in long format.
+This prevents encounter duplication in the main encounter table.
+```
+
+---
+
+# 4. Level 2: Encounter and SDOH analytic tables
+
+---
+
+## 4.1 `encounter_enriched`
+
+Unit of observation:
+
+```text
+one row per encounter
+```
+
+Generated from:
+
+```text
+fact_encounter_base
+dim_patient
+dim_diagnosis
+dim_department
+dim_provider
+dim_geography
+```
+
+Join logic:
+
+```text
+fact_encounter_base
+LEFT JOIN dim_patient
+  ON fact_encounter_base.PatientDurableKey = dim_patient.DurableKey
+
+LEFT JOIN dim_diagnosis
+  ON fact_encounter_base.PrimaryDiagnosisKey = dim_diagnosis.DiagnosisKey
+
+LEFT JOIN dim_department
+  ON fact_encounter_base.DepartmentKey = dim_department.DepartmentKey
+
+LEFT JOIN dim_provider AS provider
+  ON fact_encounter_base.ProviderDurableKey = provider.DurableKey
+
+LEFT JOIN dim_provider AS attending_provider
+  ON fact_encounter_base.AttendingProviderDurableKey = attending_provider.DurableKey
+
+LEFT JOIN dim_provider AS discharge_provider
+  ON fact_encounter_base.DischargeProviderDurableKey = discharge_provider.DurableKey
+
+LEFT JOIN dim_geography
+  ON dim_patient.CensusBlockGroupFipsCode = dim_geography.GEOID
+```
+
+Expected fields:
+
+```text
+EncounterKey
+PatientDurableKey
+Date
+AdmissionInstant
+DischargeInstant
+Type
+VisitType
+VisitTypeDescription
+AdmissionSource
+AdmissionType
+IsEdVisit
+IsHospitalAdmission
+IsHospitalOutpatientVisit
+IsInpatientAdmission
+IsObservation
+IsOutpatientFaceToFaceVisit
+
+PrimaryDiagnosisKey
+DiagnosisKey
+DiagnosisValue
+DiagnosisName
+GroupCode
+GroupName
+
+DepartmentKey
+DepartmentName
+DepartmentSpecialty
+DepartmentType
+Address
+City
+County
+PostalCode
+CensusTract
+
+PatientBirthYearBin
+SexAssignedAtBirth
+FirstRace
+OmbRace
+OmbEthnicity
+MaritalStatus
+SmokingStatus
+VitalStatus
+MyChartStatus
+SexualOrientation
+CensusBlockGroupFipsCode
+
+provider_ClinicianTitle
+provider_PrimarySpecialty
+provider_Type
+
+attending_provider_ClinicianTitle
+attending_provider_PrimarySpecialty
+attending_provider_Type
+
+discharge_provider_ClinicianTitle
+discharge_provider_PrimarySpecialty
+discharge_provider_Type
+
+PopulationValue
+CENTLAT
+CENTLON
+```
+
+Purpose:
+
+```text
+Main encounter-level analytic table.
+Supports direct encounter analysis and serves as the base for journey construction.
+```
+
+---
+
+## 4.2 `sdoh_encounter_summary`
+
+Unit of observation:
+
+```text
+one row per EncounterKey and PatientDurableKey
+```
+
+Generated from:
+
+```text
+fact_sdoh_response
+```
+
+Generation logic:
+
+```text
+fact_sdoh_response
+→ group by EncounterKey, PatientDurableKey
+→ count total answered questions
+→ count distinct SDOH domains
+→ create domain-observed indicators
+→ create answer-preserving domain tokens
+→ output sdoh_encounter_summary
+```
+
+Suggested fields:
+
+```text
+EncounterKey
+PatientDurableKey
+
+sdoh_any_observed
+sdoh_num_questions_answered
+sdoh_num_domains_answered
+
+sdoh_AlcoholUse_observed
+sdoh_Depression_observed
+sdoh_FinancialResourceStrain_observed
+sdoh_FoodInsecurity_observed
+sdoh_HousingStability_observed
+sdoh_IntimatePartnerViolence_observed
+sdoh_PhysicalActivity_observed
+sdoh_SocialConnections_observed
+sdoh_Stress_observed
+sdoh_TransportationNeeds_observed
+sdoh_Utilities_observed
+
+sdoh_domain_answer_tokens
+```
+
+Important rule:
+
+```text
+Do not assume AnswerText scoring.
+Do not convert answers into risk labels until the actual AnswerText values are reviewed.
+The first version should preserve answers rather than interpret them.
+```
+
+Safe token format:
+
+```text
+SDOH:{Domain}:{DisplayName}:{AnswerText}
+```
+
+Example structure only:
+
+```text
+SDOH:TransportationNeeds:question_label:answer_label
+```
+
+---
+
+## 4.3 `encounter_enriched_with_sdoh`
+
+Unit of observation:
+
+```text
+one row per encounter
+```
+
+Generated from:
+
+```text
+encounter_enriched
+sdoh_encounter_summary
+```
+
+Join logic:
+
+```text
+encounter_enriched
+LEFT JOIN sdoh_encounter_summary
+  ON encounter_enriched.EncounterKey = sdoh_encounter_summary.EncounterKey
+ AND encounter_enriched.PatientDurableKey = sdoh_encounter_summary.PatientDurableKey
+```
+
+Purpose:
+
+```text
+Adds SDOH context to the encounter-level analytic table without duplicating encounter rows.
+This is the preferred input for journey and sequence generation.
+```
+
+---
+
+# 5. Level 3: Journey, sequence, transition, and modeling tables
+
+---
+
+## 5.1 `journey_episode`
+
+Unit of observation:
+
+```text
+one row per observed patient-diagnosis journey
+```
+
+Generated from:
+
+```text
+encounter_enriched_with_sdoh
+```
+
+Base journey definition:
+
+```text
+journey_id = hash(PatientDurableKey, DiagnosisValue)
+```
+
+Generation logic:
+
+```text
+encounter_enriched_with_sdoh
+→ exclude encounters with no usable diagnosis
+→ sort by PatientDurableKey, DiagnosisValue, Date, AdmissionInstant, EncounterKey
+→ group by PatientDurableKey and DiagnosisValue
+→ compute journey-level features
+→ output journey_episode
+```
+
+Recommended exclusion rule for base version:
+
+```text
+PrimaryDiagnosisKey = -1
+OR DiagnosisValue is missing
+```
+
+Suggested fields:
+
+```text
+journey_id
+PatientDurableKey
+DiagnosisValue
+DiagnosisName
+GroupCode
+GroupName
+
+first_observed_date
+last_observed_date
+journey_observed_duration_days
+
 n_encounters
-n_unique_visit_dates
-duration_days_observed
-n_same_day_multiencounter_dates
-n_singleton_journey_flag
-```
+n_unique_departments
+n_unique_department_types
+n_unique_provider_types
 
-#### Gap / continuity
+n_ed_visits
+n_hospital_admissions
+n_hospital_outpatient_visits
+n_inpatient_admissions
+n_observations
+n_outpatient_face_to_face_visits
 
-```text
+first_Type
+last_Type
+first_VisitTypeDescription
+last_VisitTypeDescription
+first_DepartmentType
+last_DepartmentType
+
 min_gap_days
 median_gap_days
-max_gap_days
 mean_gap_days
-has_gap_30plus
-has_gap_90plus
-has_gap_180plus
-has_30d_followup
-has_90d_followup
+max_gap_days
+
+n_long_gaps_30d
+n_long_gaps_90d
+n_long_gaps_180d
+n_long_gaps_365d
+
+sdoh_any_observed_during_journey
+sdoh_num_domains_observed_during_journey
+sdoh_domain_history
+
+observed_start_censored_flag
+observed_end_censored_flag
 ```
 
-#### Care setting mix
+Optional episode-splitting version:
 
 ```text
-pct_ed
-pct_hospital_admission
-pct_inpatient
-pct_observation
-pct_outpatient_face_to_face
-n_department_types
-first_department_type
-last_department_type
-setting_transition_count
+If a patient has the same DiagnosisValue but there is a very long gap,
+split the sequence into multiple episodes.
 ```
 
-Exact source fields for care setting mix:
+Example:
 
 ```text
-encounters.IsEdVisit
-encounters.IsHospitalAdmission
-encounters.IsHospitalOutpatientVisit
-encounters.IsInpatientAdmission
-encounters.IsObservation
-encounters.IsOutpatientFaceToFaceVisit
-departments.DepartmentType
+episode_number increments when gap_days > 180
 ```
 
-#### Transition motifs
+Then:
 
 ```text
-has_op_to_ed
-has_ed_to_inpatient
-has_inpatient_to_outpatient
-has_hospital_to_no_30d_followup
-has_hospital_to_no_90d_followup
+journey_id = hash(PatientDurableKey, DiagnosisValue, episode_number)
 ```
 
-These are derived from ordered event tokens and should be versioned.
-
-#### Diagnosis
+Do not assume the best gap threshold in advance. Test several options:
 
 ```text
-diagnosis_group_code       ← diagnosis.GroupCode
-diagnosis_value            ← diagnosis.DiagnosisValue
-diagnosis_specificity_length
-is_no_diagnosis_flag       ← encounters.PrimaryDiagnosisKey = -1
+90 days
+180 days
+365 days
 ```
 
-#### Provider continuity
+---
+
+## 5.2 `journey_event_sequence`
+
+Unit of observation:
 
 ```text
-n_unique_provider_durable_keys              ← encounters.ProviderDurableKey
-n_unique_attending_provider_durable_keys    ← encounters.AttendingProviderDurableKey
-n_unique_discharge_provider_durable_keys    ← encounters.DischargeProviderDurableKey
-n_provider_types                            ← joined providers.Type by selected role(s)
-provider_continuity_index
+one row per encounter event inside a journey
 ```
 
-Provider continuity index candidate:
+Generated from:
 
 ```text
-max encounters with same provider role key / encounters with non-missing provider role key
+encounter_enriched_with_sdoh
+journey_episode
 ```
 
-#### SDOH
+Generation logic:
 
 ```text
-sdoh_any_response                 ← any social_determinants row for encounter/journey
-sdoh_n_domains_answered           ← distinct social_determinants.Domain
-sdoh_domain_count_observed
-sdoh_domain_risk_labels_after_validation
+encounter_enriched_with_sdoh
+→ assign journey_id using PatientDurableKey and DiagnosisValue
+→ sort within journey by Date, AdmissionInstant, EncounterKey
+→ assign event_index
+→ calculate days_since_previous_event
+→ convert days_since_previous_event into gap_bin
+→ generate interpretable event tokens
+→ output journey_event_sequence
 ```
 
-Do not create risk labels from SDOH until `AnswerText` values are profiled and scoring rules are validated.
-
-#### Patient / geography
+Suggested fields:
 
 ```text
-birth_year_bin                    ← patients.PatientBirthYearBin
-sex_assigned_at_birth             ← patients.SexAssignedAtBirth
-omb_race                          ← patients.OmbRace
-omb_ethnicity                     ← patients.OmbEthnicity
-marital_status                    ← patients.MaritalStatus
-smoking_status                    ← patients.SmokingStatus
-mychart_status                    ← patients.MyChartStatus
-vital_status                      ← patients.VitalStatus
-home_geo_status                   ← patients.CensusBlockGroupFipsCode join status
-home_population_value_bin         ← tigercensuscodes.PopulationValue
-home_centlat                      ← tigercensuscodes.CENTLAT
-home_centlon                      ← tigercensuscodes.CENTLON
+journey_id
+PatientDurableKey
+EncounterKey
+
+event_index
+Date
+AdmissionInstant
+DischargeInstant
+
+days_since_previous_event
+gap_bin
+
+PrimaryDiagnosisKey
+DiagnosisValue
+DiagnosisName
+GroupCode
+GroupName
+
+Type
+VisitType
+VisitTypeDescription
+DepartmentKey
+DepartmentName
+DepartmentSpecialty
+DepartmentType
+
+IsEdVisit
+IsHospitalAdmission
+IsHospitalOutpatientVisit
+IsInpatientAdmission
+IsObservation
+IsOutpatientFaceToFaceVisit
+
+sdoh_any_observed
+sdoh_num_questions_answered
+sdoh_num_domains_answered
+sdoh_domain_answer_tokens
+
+event_token
+time_gap_token
+care_setting_token
+diagnosis_token
+department_token
+sdoh_token
 ```
 
-## Layer 8: analysis-specific tables
-
-Create focused tables only after selecting a story.
-
-| Table | Unit | Purpose |
-|---|---|---|
-| `analysis_gap_followup` | Journey or index encounter | Delay/follow-up analysis. |
-| `analysis_ed_to_outpatient` | ED encounter | ED-to-follow-up pathway. |
-| `analysis_sdoh_transport` | Patient/journey | Transportation and access lens. |
-| `analysis_mychart_engagement` | Patient/journey | MyChart engagement and continuity. |
-| `analysis_journey_archetypes` | Journey | Clustering/typology output. |
-| `analysis_sankey_edges` | Transition edge | Flow visualization. |
-
-## Recommended project folder structure
+Suggested time-gap bins:
 
 ```text
-project/
-  data/
-    raw/
-    staging/
-    marts/
-    model/
-  docs/
-    datafest_relation_model.md
-    datafest_data_structure_design.md
-    data_dictionary_notes.md
-  notebooks/
-    00_schema_validation.ipynb
-    01_join_qc.ipynb
-    02_encounter_enrichment.ipynb
-    03_sdoh_aggregation.ipynb
-    04_journey_construction.ipynb
-    05_tokenization.ipynb
-    06_story_exploration.ipynb
-  src/
-    load.py
-    schema.py
-    missingness.py
-    joins.py
-    sdoh.py
-    journeys.py
-    tokens.py
-    qc.py
+GAP:START
+GAP:0D
+GAP:1_7D
+GAP:8_30D
+GAP:31_90D
+GAP:91_180D
+GAP:181_365D
+GAP:365PLUS
+GAP:UNKNOWN
 ```
 
-## Minimal implementation order
+Suggested event token components:
 
-1. Validate exact schemas.
-2. Build staging tables preserving original columns.
-3. Run join QC and unmatched-key reports.
-4. Build `mart_encounter_sdoh` by aggregating SDOH to encounter level.
-5. Build `mart_encounter_enriched` from encounters plus patient, diagnosis, department, provider aliases, SDOH aggregates, and geography.
-6. Build baseline `mart_journey_episode` using `encounters.PatientDurableKey + diagnosis.DiagnosisValue`.
-7. Build `mart_journey_event_token` with v1 compact interpretable tokens.
-8. Build `model_journey_features` for clustering, gap analysis, and story selection.
+```text
+GAP:{gap_bin}
+TYPE:{Type}
+VTD:{VisitTypeDescription}
+DEPT_TYPE:{DepartmentType}
+DEPT_SPEC:{DepartmentSpecialty}
+DXG:{GroupCode}
+DX:{DiagnosisValue}
+SETTING:{care_setting_flags}
+SDOH:{sdoh_summary}
+```
 
-## Do-not-assume checklist
+Example token structure only:
 
-- Do not assume undocumented column names.
-- Do not use `Department Name`; use `DepartmentName`.
-- Do not use `CENTLONG`; use `CENTLON`.
-- Do not use `Population`; use `PopulationValue`.
-- Do not assume `providers.DurableKey` links to `patients`; it links to provider-role keys in `encounters`.
-- Do not treat SDOH absence as no social need.
-- Do not collapse all missing-like values into one missing category.
-- Do not treat observed journey windows as complete real-world journeys.
+```text
+GAP:8_30D | TYPE:{Type} | VTD:{VisitTypeDescription} | DEPT_TYPE:{DepartmentType} | DXG:{GroupCode} | SETTING:{flags}
+```
+
+Do not hard-code actual token values until inspecting valid values from the data.
+
+---
+
+## 5.3 `journey_transition`
+
+Unit of observation:
+
+```text
+one row per transition between consecutive events in a journey
+```
+
+Generated from:
+
+```text
+journey_event_sequence
+```
+
+Generation logic:
+
+```text
+journey_event_sequence
+→ within each journey_id, order by event_index
+→ pair event i with event i + 1
+→ calculate transition gap
+→ create from/to fields
+→ create transition token
+→ output journey_transition
+```
+
+Suggested fields:
+
+```text
+journey_id
+PatientDurableKey
+
+from_EncounterKey
+to_EncounterKey
+
+from_event_index
+to_event_index
+
+from_Date
+to_Date
+
+gap_days
+gap_bin
+
+from_Type
+to_Type
+
+from_VisitTypeDescription
+to_VisitTypeDescription
+
+from_DepartmentType
+to_DepartmentType
+
+from_DepartmentSpecialty
+to_DepartmentSpecialty
+
+from_event_token
+to_event_token
+transition_token
+```
+
+Suggested transition token format:
+
+```text
+TRANSITION:{from_setting}_TO_{to_setting}
+```
+
+Possible setting source:
+
+```text
+Type
+DepartmentType
+care-setting flags
+```
+
+Safe first version:
+
+```text
+TRANSITION:TYPE:{from_Type}_TO_TYPE:{to_Type}
+```
+
+Purpose:
+
+```text
+Supports pathway analysis, care escalation/de-escalation analysis, Sankey diagrams, Markov chains, and transition-frequency summaries.
+```
+
+---
+
+## 5.4 `patient_summary`
+
+Unit of observation:
+
+```text
+one row per patient
+```
+
+Generated from:
+
+```text
+dim_patient
+encounter_enriched_with_sdoh
+journey_episode
+```
+
+Generation logic:
+
+```text
+dim_patient
+LEFT JOIN encounter aggregates by PatientDurableKey
+LEFT JOIN journey aggregates by PatientDurableKey
+LEFT JOIN SDOH aggregates by PatientDurableKey
+→ output patient_summary
+```
+
+Suggested fields:
+
+```text
+PatientDurableKey
+PatientBirthYearBin
+SexAssignedAtBirth
+FirstRace
+OmbRace
+OmbEthnicity
+MaritalStatus
+SmokingStatus
+VitalStatus
+MyChartStatus
+SexualOrientation
+CensusBlockGroupFipsCode
+
+n_encounters
+n_journeys
+n_unique_DiagnosisValue
+n_unique_GroupCode
+
+first_observed_encounter_date
+last_observed_encounter_date
+
+n_ed_visits
+n_hospital_admissions
+n_hospital_outpatient_visits
+n_inpatient_admissions
+n_observations
+n_outpatient_face_to_face_visits
+
+sdoh_any_observed
+sdoh_num_domains_observed
+
+geography_known_flag
+PopulationValue
+CENTLAT
+CENTLON
+```
+
+Purpose:
+
+```text
+Supports patient-level cohorting and descriptive comparisons.
+```
+
+Example use cases:
+
+```text
+Compare journeys by MyChartStatus.
+Compare journeys by PatientBirthYearBin.
+Compare encounters and gaps by geography availability.
+Compare SDOH-observed patients vs. patients without observed SDOH data.
+```
+
+---
+
+## 5.5 `diagnosis_group_summary`
+
+Unit of observation:
+
+```text
+one row per diagnosis group or diagnosis value
+```
+
+Generated from:
+
+```text
+journey_episode
+encounter_enriched_with_sdoh
+```
+
+Possible grouping levels:
+
+```text
+GroupCode + GroupName
+DiagnosisValue + DiagnosisName
+```
+
+Generation logic:
+
+```text
+journey_episode
+→ group by GroupCode and GroupName
+→ summarize journey counts, encounter counts, gap distributions, and care-setting involvement
+→ output diagnosis_group_summary
+```
+
+Suggested fields:
+
+```text
+GroupCode
+GroupName
+DiagnosisValue
+DiagnosisName
+
+n_patients
+n_journeys
+n_encounters
+
+median_journey_observed_duration_days
+median_n_encounters_per_journey
+median_max_gap_days
+
+pct_with_ed_visit
+pct_with_hospital_admission
+pct_with_inpatient_admission
+pct_with_outpatient_face_to_face_visit
+
+pct_with_sdoh_observed
+
+common_first_Type
+common_last_Type
+common_first_DepartmentType
+common_last_DepartmentType
+```
+
+Purpose:
+
+```text
+Helps identify which diagnosis groups have interesting or high-volume journey patterns.
+```
+
+---
+
+## 5.6 `model_feature_matrix`
+
+Unit of observation:
+
+```text
+one row per modeling entity
+```
+
+Recommended first version:
+
+```text
+one row per journey_id
+```
+
+Generated from:
+
+```text
+journey_episode
+journey_event_sequence
+journey_transition
+patient_summary
+```
+
+Generation logic:
+
+```text
+journey_episode
+LEFT JOIN patient_summary
+  ON journey_episode.PatientDurableKey = patient_summary.PatientDurableKey
+
+LEFT JOIN transition aggregates by journey_id
+
+LEFT JOIN token-frequency features by journey_id
+
+→ output model_feature_matrix
+```
+
+Suggested field groups:
+
+```text
+journey identity fields
+patient demographic fields
+diagnosis fields
+journey length features
+gap features
+care setting count features
+department diversity features
+provider diversity features
+SDOH observed features
+geography features
+transition count features
+token count features
+```
+
+Suggested target variables:
+
+```text
+long_gap_30d
+long_gap_90d
+long_gap_180d
+has_ed_visit_after_first_event
+has_hospital_admission
+has_inpatient_admission
+no_followup_after_discharge_30d
+high_fragmentation_journey
+journey_archetype_cluster
+```
+
+Important note:
+
+```text
+Targets should be defined only after checking whether the relevant event types and date fields are sufficiently populated.
+```
+
+---
+
+# 6. Recommended final table list
+
+The full design produces these final tables:
+
+```text
+dim_patient
+dim_diagnosis
+dim_department
+dim_provider
+dim_geography
+
+fact_encounter_base
+fact_sdoh_response
+
+encounter_enriched
+sdoh_encounter_summary
+encounter_enriched_with_sdoh
+
+journey_episode
+journey_event_sequence
+journey_transition
+
+patient_summary
+diagnosis_group_summary
+model_feature_matrix
+```
+
+The most important final analysis tables are:
+
+```text
+encounter_enriched_with_sdoh
+journey_episode
+journey_event_sequence
+journey_transition
+model_feature_matrix
+```
+
+---
+
+# 7. Generation dependency graph
+
+```text
+patients.csv
+  → dim_patient
+  → patient_summary
+  → model_feature_matrix
+
+diagnosis.csv
+  → dim_diagnosis
+  → encounter_enriched
+  → encounter_enriched_with_sdoh
+  → journey_episode
+  → journey_event_sequence
+  → journey_transition
+  → model_feature_matrix
+
+departments.csv
+  → dim_department
+  → encounter_enriched
+
+providers.csv
+  → dim_provider
+  → encounter_enriched
+
+tigercensuscodes.csv
+  → dim_geography
+  → encounter_enriched
+  → patient_summary
+
+encounters.csv
+  → fact_encounter_base
+  → encounter_enriched
+  → encounter_enriched_with_sdoh
+  → journey_episode
+  → journey_event_sequence
+  → journey_transition
+
+social_determinants.csv
+  → fact_sdoh_response
+  → sdoh_encounter_summary
+  → encounter_enriched_with_sdoh
+  → journey_episode
+  → journey_event_sequence
+```
+
+---
+
+# 8. Final pipeline overview
+
+```text
+Step 1: Load raw CSVs
+
+Step 2: Create clean base tables
+  - dim_patient
+  - dim_diagnosis
+  - dim_department
+  - dim_provider
+  - dim_geography
+  - fact_encounter_base
+  - fact_sdoh_response
+
+Step 3: Create encounter-level analytic table
+  - encounter_enriched
+
+Step 4: Summarize social determinants at encounter level
+  - sdoh_encounter_summary
+
+Step 5: Attach SDOH summaries to encounter table
+  - encounter_enriched_with_sdoh
+
+Step 6: Define observed patient-diagnosis journeys
+  - journey_episode
+
+Step 7: Create ordered event sequence within each journey
+  - journey_event_sequence
+
+Step 8: Create transition table between consecutive events
+  - journey_transition
+
+Step 9: Create reporting and modeling tables
+  - patient_summary
+  - diagnosis_group_summary
+  - model_feature_matrix
+```
+
+---
+
+# 9. Design principles
+
+## 9.1 Preserve raw keys
+
+Do not rename or reinterpret keys without keeping the original fields.
+
+Critical keys:
+
+```text
+EncounterKey
+PatientDurableKey
+DurableKey
+DiagnosisKey
+PrimaryDiagnosisKey
+DepartmentKey
+ProviderDurableKey
+AttendingProviderDurableKey
+DischargeProviderDurableKey
+CensusBlockGroupFipsCode
+GEOID
+```
+
+---
+
+## 9.2 Keep provider roles separate
+
+Do not collapse these fields into a single provider field:
+
+```text
+ProviderDurableKey
+AttendingProviderDurableKey
+DischargeProviderDurableKey
+```
+
+They represent different roles in the encounter.
+
+---
+
+## 9.3 Use `DiagnosisValue` for journey identity
+
+Use:
+
+```text
+PatientDurableKey + DiagnosisValue
+```
+
+as the base journey definition.
+
+Do not use:
+
+```text
+PatientDurableKey + PrimaryDiagnosisKey
+```
+
+as the final journey definition unless doing a key-level sensitivity check.
+
+---
+
+## 9.4 Keep SDOH responses long before summarizing
+
+The source SDOH table has one row per answered question.
+
+Keep this table:
+
+```text
+fact_sdoh_response
+```
+
+Then create:
+
+```text
+sdoh_encounter_summary
+```
+
+This avoids duplicating encounter rows.
+
+---
+
+## 9.5 Do not assume answer scoring
+
+For SDOH:
+
+```text
+Domain
+DisplayName
+AnswerText
+```
+
+should be preserved.
+
+Do not create risk labels until actual answer values have been reviewed.
+
+---
+
+## 9.6 Treat missingness as informative
+
+Different missing-like values may mean different things.
+
+Suggested normalized missingness classes:
+
+```text
+asked_not_answered_or_unable
+not_recorded_or_unknown
+system_missing
+structural_not_applicable
+known_value
+```
+
+Keep both:
+
+```text
+original value
+normalized missingness class
+```
+
+where possible.
+
+---
+
+## 9.7 Maintain multiple grains
+
+The design intentionally keeps several units of observation:
+
+```text
+patient
+encounter
+SDOH response
+patient-diagnosis journey
+journey event
+journey transition
+diagnosis group
+modeling row
+```
+
+This prevents forcing all analysis into one overly wide table.
+
+---
+
+# 10. Table grain summary
+
+| Table                          | Grain                                           | Generated from                                     |
+| ------------------------------ | ----------------------------------------------- | -------------------------------------------------- |
+| `dim_patient`                  | one row per patient                             | `patients.csv`                                     |
+| `dim_diagnosis`                | one row per diagnosis                           | `diagnosis.csv`                                    |
+| `dim_department`               | one row per department                          | `departments.csv`                                  |
+| `dim_provider`                 | one row per provider                            | `providers.csv`                                    |
+| `dim_geography`                | one row per census block group                  | `tigercensuscodes.csv`                             |
+| `fact_encounter_base`          | one row per encounter                           | `encounters.csv`                                   |
+| `fact_sdoh_response`           | one row per SDOH response                       | `social_determinants.csv`                          |
+| `encounter_enriched`           | one row per encounter                           | encounters + dimensions                            |
+| `sdoh_encounter_summary`       | one row per patient-encounter with SDOH summary | `fact_sdoh_response`                               |
+| `encounter_enriched_with_sdoh` | one row per encounter                           | `encounter_enriched` + `sdoh_encounter_summary`    |
+| `journey_episode`              | one row per patient-diagnosis journey           | `encounter_enriched_with_sdoh`                     |
+| `journey_event_sequence`       | one row per encounter within a journey          | `encounter_enriched_with_sdoh` + `journey_episode` |
+| `journey_transition`           | one row per consecutive event transition        | `journey_event_sequence`                           |
+| `patient_summary`              | one row per patient                             | patient + encounter + journey aggregates           |
+| `diagnosis_group_summary`      | one row per diagnosis group or diagnosis value  | journey + encounter aggregates                     |
+| `model_feature_matrix`         | one row per modeling entity, usually journey    | journey + patient + token + transition features    |
+
+---
+
+# 11. Minimal viable version
+
+If time is limited, build only these five tables first:
+
+```text
+encounter_enriched_with_sdoh
+journey_episode
+journey_event_sequence
+journey_transition
+model_feature_matrix
+```
+
+Minimum pipeline:
+
+```text
+1. Build encounter_enriched from encounters + patients + diagnosis + departments + providers + geography.
+
+2. Build sdoh_encounter_summary from social_determinants.
+
+3. Join SDOH summary onto encounter_enriched.
+
+4. Build journey_episode using PatientDurableKey + DiagnosisValue.
+
+5. Build journey_event_sequence by sorting encounters within each journey.
+
+6. Build journey_transition from consecutive journey events.
+
+7. Build model_feature_matrix from journey-level aggregates.
+```
+
+This minimal version is enough for:
+
+```text
+journey clustering
+gap analysis
+transition analysis
+diagnosis group comparison
+SDOH-associated journey summaries
+patient-level segmentation
+```
+
+---
+
+# 12. Recommended output folder structure
+
+```text
+data/
+  raw/
+    departments.csv
+    diagnosis.csv
+    encounters.csv
+    patients.csv
+    providers.csv
+    social_determinants.csv
+    tigercensuscodes.csv
+
+  interim/
+    dim_patient.parquet
+    dim_diagnosis.parquet
+    dim_department.parquet
+    dim_provider.parquet
+    dim_geography.parquet
+    fact_encounter_base.parquet
+    fact_sdoh_response.parquet
+
+  processed/
+    encounter_enriched.parquet
+    sdoh_encounter_summary.parquet
+    encounter_enriched_with_sdoh.parquet
+    journey_episode.parquet
+    journey_event_sequence.parquet
+    journey_transition.parquet
+    patient_summary.parquet
+    diagnosis_group_summary.parquet
+    model_feature_matrix.parquet
+
+docs/
+  data_structure_design.md
+  relation_model.md
+  column_dictionary.md
+  join_validation_report.md
+
+notebooks/
+  01_schema_checks.ipynb
+  02_build_base_tables.ipynb
+  03_build_encounter_enriched.ipynb
+  04_build_journeys.ipynb
+  05_build_tokens_and_transitions.ipynb
+  06_modeling_or_clustering.ipynb
+
+src/
+  load_data.py
+  clean_missingness.py
+  build_dimensions.py
+  build_encounter_enriched.py
+  build_sdoh_summary.py
+  build_journeys.py
+  build_tokens.py
+  build_features.py
+```
+
+---
+
+# 13. Quality-control checks
+
+## 13.1 Key uniqueness checks
+
+```text
+patients.DurableKey should be unique.
+diagnosis.DiagnosisKey should be unique.
+departments.DepartmentKey should be unique.
+providers.DurableKey should be unique.
+tigercensuscodes.GEOID should be unique.
+encounters.EncounterKey should be unique.
+```
+
+---
+
+## 13.2 Join coverage checks
+
+Check unmatched rates for:
+
+```text
+encounters.PatientDurableKey → patients.DurableKey
+encounters.PrimaryDiagnosisKey → diagnosis.DiagnosisKey
+encounters.DepartmentKey → departments.DepartmentKey
+encounters.ProviderDurableKey → providers.DurableKey
+encounters.AttendingProviderDurableKey → providers.DurableKey
+encounters.DischargeProviderDurableKey → providers.DurableKey
+patients.CensusBlockGroupFipsCode → tigercensuscodes.GEOID
+social_determinants.EncounterKey → encounters.EncounterKey
+social_determinants.PatientDurableKey → patients.DurableKey
+```
+
+Important note:
+
+```text
+Some provider keys may not match providers.DurableKey.
+This can happen when the “provider” is not a person represented in providers.csv.
+Do not treat every unmatched provider key as a data error.
+```
+
+---
+
+## 13.3 Encounter-date checks
+
+Check:
+
+```text
+Date parse success rate
+AdmissionInstant parse success rate
+DischargeInstant parse success rate
+AdmissionInstant <= DischargeInstant when both exist
+Date within expected observation window
+```
+
+---
+
+## 13.4 Journey checks
+
+Check:
+
+```text
+number of journeys
+number of encounters excluded because PrimaryDiagnosisKey = -1
+number of encounters excluded because DiagnosisValue is missing
+journey length distribution
+number of one-encounter journeys
+max encounters per journey
+max observed journey duration
+gap distribution
+```
+
+---
+
+## 13.5 SDOH checks
+
+Check:
+
+```text
+number of SDOH response rows
+number of unique EncounterKey values in SDOH table
+number of unique PatientDurableKey values in SDOH table
+number of unique Domain values
+number of unique DisplayName values
+number of unique AnswerText values by Domain
+encounter-level SDOH coverage rate
+patient-level SDOH coverage rate
+```
+
+---
+
+# 14. Final analytic concept
+
+The main analytic object is:
+
+```text
+an observed patient-diagnosis journey
+```
+
+Defined as:
+
+```text
+all observed encounters for one PatientDurableKey and one DiagnosisValue,
+ordered by Date, AdmissionInstant, and EncounterKey
+```
+
+The main sequence object is:
+
+```text
+one tokenized event per encounter within a journey
+```
+
+The main transition object is:
+
+```text
+one transition between each pair of consecutive encounter events in a journey
+```
+
+Together, the final structure supports:
+
+```text
+What happened?
+When did it happen?
+Where did care occur?
+What diagnosis was involved?
+What type of care was provided?
+How long were the gaps?
+Did the journey escalate or de-escalate?
+Were SDOH responses observed?
+How do journeys differ across patients, diagnoses, departments, and communities?
+```
