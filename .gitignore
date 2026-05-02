@@ -4,3 +4,16 @@ rl/output/*
 rl/synthetic/*
 *.csv
 DATA/
+
+# Generated sequence model artifacts
+token_sequence_model/*.pt
+token_sequence_model/*.csv.gz
+token_sequence_model/*vocab*.json
+
+# Generated processed/interim data
+data/processed/**/*.pt
+data/processed/**/*.csv.gz
+data/processed/**/*vocab*.json
+data/interim/*.sqlite
+data/interim/*.sqlite-wal
+data/interim/*.sqlite-shm
