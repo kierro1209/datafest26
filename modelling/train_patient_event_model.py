@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
@@ -43,6 +44,62 @@ class PreparedData:
     metadata: dict[str, Any]
 
 
+# Per-target-timestep roles for temporal split (aligned with target_* tensors).
+SPLIT_IGNORE = 0
+SPLIT_TRAIN = 1
+SPLIT_VAL = 2
+SPLIT_TEST = 3
+
+HEAD_TO_TARGET: dict[str, str] = {
+    "type": "type",
+    "event_description": "event_description",
+    "group_code": "group_code",
+    "diagnosis_value": "diagnosis_value",
+    "gap": "gap",
+    "setting": "setting",
+    "dept_type": "dept_type",
+    "dept_specialty": "dept_specialty",
+    "facility_size": "facility_size",
+    "region": "region",
+}
+
+
+def temporal_split_ends(seq_len: int, train_f: float, valid_f: float, test_f: float) -> tuple[int, int]:
+    """Exclusive boundaries (end_train, end_val) on target indices [0, seq_len).
+
+    Train targets index i in [0, end_train), val in [end_train, end_val), test in [end_val, seq_len).
+    """
+    if seq_len < 2:
+        return 0, 0
+    s = train_f + valid_f + test_f
+    if s <= 0:
+        train_f, valid_f, test_f = 0.7, 0.15, 0.15
+        s = 1.0
+    train_f, valid_f, test_f = train_f / s, valid_f / s, test_f / s
+
+    n_train = max(1, int(round(seq_len * train_f)))
+    n_val = int(round(seq_len * valid_f))
+    n_test = seq_len - n_train - n_val
+    if n_test < 1:
+        n_test = 1
+        n_val = max(0, seq_len - n_train - n_test)
+    while n_train + n_val + n_test > seq_len and n_val > 0:
+        n_val -= 1
+        n_test = seq_len - n_train - n_val
+    while n_train + n_val + n_test > seq_len and n_train > 1:
+        n_train -= 1
+        n_test = seq_len - n_train - n_val
+    if n_train >= seq_len:
+        n_train = seq_len - 1
+    end_train = n_train
+    end_val = n_train + n_val
+    if end_val > seq_len:
+        end_val = seq_len
+    if end_train >= end_val:
+        end_val = min(seq_len, end_train + 1)
+    return end_train, end_val
+
+
 class PatientSequenceDataset(Dataset):
     def __init__(
         self,
@@ -51,12 +108,20 @@ class PatientSequenceDataset(Dataset):
         sdoh_fields: list[str],
         patient_context_fields: list[str],
         patient_numeric_fields: list[str],
+        temporal_split: bool = False,
+        train_fraction: float = 0.7,
+        valid_fraction: float = 0.15,
+        test_fraction: float = 0.15,
     ) -> None:
         self.sequences = sequences
         self.max_seq_len = max_seq_len
         self.sdoh_fields = sdoh_fields
         self.patient_context_fields = patient_context_fields
         self.patient_numeric_fields = patient_numeric_fields
+        self.temporal_split = temporal_split
+        self.train_fraction = train_fraction
+        self.valid_fraction = valid_fraction
+        self.test_fraction = test_fraction
 
     def __len__(self) -> int:
         return len(self.sequences)
@@ -130,6 +195,17 @@ class PatientSequenceDataset(Dataset):
             region_ids += [-100] * pad_n
             attention_mask += [0] * pad_n
 
+        split_role = [SPLIT_IGNORE] * self.max_seq_len
+        if self.temporal_split:
+            end_train, end_val = temporal_split_ends(seq_len, self.train_fraction, self.valid_fraction, self.test_fraction)
+            for i in range(seq_len):
+                if i < end_train:
+                    split_role[i] = SPLIT_TRAIN
+                elif i < end_val:
+                    split_role[i] = SPLIT_VAL
+                else:
+                    split_role[i] = SPLIT_TEST
+
         batch = {
             "input_type_ids": torch.tensor(input_type_ids, dtype=torch.long),
             "input_event_description_ids": torch.tensor(input_event_description_ids, dtype=torch.long),
@@ -155,6 +231,8 @@ class PatientSequenceDataset(Dataset):
             "target_facility_size": torch.tensor(size_ids, dtype=torch.long),
             "target_region": torch.tensor(region_ids, dtype=torch.long),
         }
+        if self.temporal_split:
+            batch["split_role"] = torch.tensor(split_role, dtype=torch.long)
         for field in self.sdoh_fields:
             batch[f"input_{field}"] = torch.tensor(sdoh_inputs[field], dtype=torch.long)
         return batch
@@ -508,79 +586,113 @@ def split_sequences(sequences: list[dict[str, Any]], valid_fraction: float, rand
     return train, valid
 
 
-def compute_losses(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor], weights: dict[str, float]) -> tuple[torch.Tensor, dict[str, float]]:
+def compute_losses(
+    outputs: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    weights: dict[str, float],
+    position_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Cross-entropy per head; if position_mask is set, average only over masked target steps."""
     ce = nn.CrossEntropyLoss(ignore_index=-100)
-    type_loss = ce(outputs["type"].transpose(1, 2), batch["target_type"])
-    event_description_loss = ce(outputs["event_description"].transpose(1, 2), batch["target_event_description"])
-    group_code_loss = ce(outputs["group_code"].transpose(1, 2), batch["target_group_code"])
-    diagnosis_value_loss = ce(outputs["diagnosis_value"].transpose(1, 2), batch["target_diagnosis_value"])
-    gap_loss = ce(outputs["gap"].transpose(1, 2), batch["target_gap"])
-    setting_loss = ce(outputs["setting"].transpose(1, 2), batch["target_setting"])
-    dept_loss = ce(outputs["dept_type"].transpose(1, 2), batch["target_dept_type"])
-    dept_specialty_loss = ce(outputs["dept_specialty"].transpose(1, 2), batch["target_dept_specialty"])
-    size_loss = ce(outputs["facility_size"].transpose(1, 2), batch["target_facility_size"])
-    region_loss = ce(outputs["region"].transpose(1, 2), batch["target_region"])
-    total = (
-        weights["type"] * type_loss
-        + weights["event_description"] * event_description_loss
-        + weights["group_code"] * group_code_loss
-        + weights["diagnosis_value"] * diagnosis_value_loss
-        + weights["gap"] * gap_loss
-        + weights["setting"] * setting_loss
-        + weights["dept_type"] * dept_loss
-        + weights["dept_specialty"] * dept_specialty_loss
-        + weights["facility_size"] * size_loss
-        + weights["region"] * region_loss
-    )
-    metrics = {
-        "type": float(type_loss.detach().cpu()),
-        "event_description": float(event_description_loss.detach().cpu()),
-        "group_code": float(group_code_loss.detach().cpu()),
-        "diagnosis_value": float(diagnosis_value_loss.detach().cpu()),
-        "gap": float(gap_loss.detach().cpu()),
-        "setting": float(setting_loss.detach().cpu()),
-        "dept_type": float(dept_loss.detach().cpu()),
-        "dept_specialty": float(dept_specialty_loss.detach().cpu()),
-        "facility_size": float(size_loss.detach().cpu()),
-        "region": float(region_loss.detach().cpu()),
-        "total": float(total.detach().cpu()),
-    }
+    per_head: dict[str, torch.Tensor] = {}
+    for head_key, target_suffix in HEAD_TO_TARGET.items():
+        logits = outputs[head_key].transpose(1, 2)
+        targets = batch[f"target_{target_suffix}"]
+        if position_mask is None:
+            per_head[head_key] = ce(logits, targets)
+        else:
+            per_tok = F.cross_entropy(logits, targets, ignore_index=-100, reduction="none")
+            m = position_mask & (targets != -100)
+            if m.any():
+                per_head[head_key] = per_tok[m].mean()
+            else:
+                per_head[head_key] = outputs[head_key].float().sum() * 0.0
+    total = sum(weights[k] * per_head[k] for k in weights if k in per_head)
+    metrics = {k: float(per_head[k].detach().cpu()) for k in per_head}
+    metrics["total"] = float(total.detach().cpu())
     return total, metrics
 
 
-def run_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Optimizer | None, device: torch.device, weights: dict[str, float]) -> dict[str, float]:
+def _accumulate_accuracy_micro(
+    outputs: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    position_mask: torch.Tensor,
+    top_k: int,
+    correct_sum: dict[str, float],
+    total_sum: dict[str, float],
+    topk_correct_sum: dict[str, float],
+) -> None:
+    for head_key, target_suffix in HEAD_TO_TARGET.items():
+        logits = outputs[head_key]
+        targets = batch[f"target_{target_suffix}"]
+        m = position_mask & (targets != -100)
+        if not m.any():
+            continue
+        pred = logits.argmax(dim=1)
+        correct = (pred == targets) & m
+        ck = f"acc_{head_key}"
+        correct_sum[ck] = correct_sum.get(ck, 0.0) + correct.sum().float().item()
+        total_sum[ck] = total_sum.get(ck, 0.0) + m.sum().float().item()
+        if top_k > 1 and logits.size(1) >= top_k:
+            kk = min(top_k, logits.size(1))
+            _, topv = logits.topk(kk, dim=1)
+            hit = (topv == targets.unsqueeze(1)).any(dim=1) & m
+            tk = f"top{top_k}_{head_key}"
+            topk_correct_sum[tk] = topk_correct_sum.get(tk, 0.0) + hit.sum().float().item()
+            total_sum[tk] = total_sum.get(tk, 0.0) + m.sum().float().item()
+
+
+def run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer | None,
+    device: torch.device,
+    weights: dict[str, float],
+    *,
+    temporal: bool = False,
+    split_role_filter: int | None = None,
+    compute_accuracy: bool = False,
+    top_k: int = 1,
+) -> dict[str, float]:
     train_mode = optimizer is not None
     model.train(train_mode)
-    totals = {
-        "type": 0.0,
-        "event_description": 0.0,
-        "group_code": 0.0,
-        "diagnosis_value": 0.0,
-        "gap": 0.0,
-        "setting": 0.0,
-        "dept_type": 0.0,
-        "dept_specialty": 0.0,
-        "facility_size": 0.0,
-        "region": 0.0,
-        "total": 0.0,
-    }
+    totals: dict[str, float] = {}
+    correct_sum: dict[str, float] = {}
+    total_sum: dict[str, float] = {}
+    topk_correct_sum: dict[str, float] = {}
     batches = 0
     for batch in loader:
         batch = {k: v.to(device) for k, v in batch.items()}
+        position_mask: torch.Tensor | None = None
+        if temporal:
+            assert split_role_filter is not None
+            position_mask = batch["split_role"] == split_role_filter
         with torch.set_grad_enabled(train_mode):
             outputs = model(batch)
-            loss, metrics = compute_losses(outputs, batch, weights)
+            loss, metrics = compute_losses(outputs, batch, weights, position_mask)
             if train_mode:
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
         for key, value in metrics.items():
-            totals[key] += value
+            totals[key] = totals.get(key, 0.0) + value
+        if compute_accuracy and temporal and split_role_filter is not None:
+            pm = batch["split_role"] == split_role_filter
+            _accumulate_accuracy_micro(outputs, batch, pm, top_k, correct_sum, total_sum, topk_correct_sum)
         batches += 1
     if batches == 0:
         return totals
-    return {key: value / batches for key, value in totals.items()}
+    out = {key: value / batches for key, value in totals.items()}
+    for ck, c in correct_sum.items():
+        denom = total_sum.get(ck, 0.0)
+        if denom > 0:
+            out[ck] = c / denom
+    for tk, c in topk_correct_sum.items():
+        denom = total_sum.get(tk, 0.0)
+        if denom > 0:
+            out[tk] = c / denom
+    return out
 
 
 def save_artifacts(output_dir: Path, prepared: PreparedData, model: nn.Module, history: list[dict[str, Any]], args: argparse.Namespace) -> None:
@@ -622,7 +734,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--valid-fraction", type=float, default=0.1)
+    p.add_argument(
+        "--split-strategy",
+        choices=["temporal", "patient_holdout"],
+        default="temporal",
+        help="temporal: train/val/test targets within each patient sequence; patient_holdout: hold out entire patient sequences for validation.",
+    )
+    p.add_argument("--temporal-train-frac", type=float, default=0.7, help="Fraction of events (per sequence) used as train targets.")
+    p.add_argument("--temporal-val-frac", type=float, default=0.15, help="Fraction of events for validation targets.")
+    p.add_argument("--temporal-test-frac", type=float, default=0.15, help="Fraction of events for test targets.")
+    p.add_argument(
+        "--valid-fraction",
+        type=float,
+        default=0.1,
+        help="patient_holdout only: fraction of patient sequences held out for validation.",
+    )
+    p.add_argument("--top-k-accuracy", type=int, default=1, help="If >1, report top-k hit rate on val/test (temporal split).")
     p.add_argument("--min-token-freq", type=int, default=1)
     p.add_argument("--num-regions", type=int, default=16)
     p.add_argument("--w-gap", type=float, default=1.0)
@@ -660,41 +787,79 @@ def main() -> None:
     if not prepared.sequences:
         raise SystemExit("No patient sequences with at least two events were found.")
 
-    train_sequences, valid_sequences = split_sequences(prepared.sequences, args.valid_fraction, args.seed)
-    if not train_sequences:
-        train_sequences = prepared.sequences
-        valid_sequences = []
+    sdoh_inputs = [f"sdoh_{idx}" for idx in range(len(prepared.sdoh_fields))]
 
-    indexed_train_sequences = []
-    for seq in train_sequences:
-        clone = dict(seq)
-        for idx, field in enumerate(prepared.sdoh_fields):
-            clone[f"sdoh_{idx}"] = clone[field]
-        indexed_train_sequences.append(clone)
-    indexed_valid_sequences = []
-    for seq in valid_sequences:
-        clone = dict(seq)
-        for idx, field in enumerate(prepared.sdoh_fields):
-            clone[f"sdoh_{idx}"] = clone[field]
-        indexed_valid_sequences.append(clone)
+    if args.split_strategy == "temporal":
+        tf, vf, sf = args.temporal_train_frac, args.temporal_val_frac, args.temporal_test_frac
+        s = tf + vf + sf
+        if s <= 0 or tf < 0 or vf < 0 or sf < 0:
+            raise SystemExit(f"Temporal fractions must be non-negative and sum to a positive value; got train={tf}, val={vf}, test={sf}.")
+        tf, vf, sf = tf / s, vf / s, sf / s
+        indexed_all = []
+        for seq in prepared.sequences:
+            clone = dict(seq)
+            for idx, field in enumerate(prepared.sdoh_fields):
+                clone[f"sdoh_{idx}"] = clone[field]
+            indexed_all.append(clone)
+        full_ds = PatientSequenceDataset(
+            indexed_all,
+            max_seq_len=args.max_seq_len,
+            sdoh_fields=sdoh_inputs,
+            patient_context_fields=prepared.patient_context_fields,
+            patient_numeric_fields=prepared.patient_numeric_fields,
+            temporal_split=True,
+            train_fraction=tf,
+            valid_fraction=vf,
+            test_fraction=sf,
+        )
+        train_loader = DataLoader(full_ds, batch_size=args.batch_size, shuffle=True)
+        eval_loader = DataLoader(full_ds, batch_size=args.batch_size, shuffle=False)
+        valid_loader = eval_loader
+        use_temporal = True
+    else:
+        train_sequences, valid_sequences = split_sequences(prepared.sequences, args.valid_fraction, args.seed)
+        if not train_sequences:
+            train_sequences = prepared.sequences
+            valid_sequences = []
 
-    train_ds = PatientSequenceDataset(
-        indexed_train_sequences,
-        max_seq_len=args.max_seq_len,
-        sdoh_fields=[f"sdoh_{idx}" for idx in range(len(prepared.sdoh_fields))],
-        patient_context_fields=prepared.patient_context_fields,
-        patient_numeric_fields=prepared.patient_numeric_fields,
-    )
-    valid_ds = PatientSequenceDataset(
-        indexed_valid_sequences,
-        max_seq_len=args.max_seq_len,
-        sdoh_fields=[f"sdoh_{idx}" for idx in range(len(prepared.sdoh_fields))],
-        patient_context_fields=prepared.patient_context_fields,
-        patient_numeric_fields=prepared.patient_numeric_fields,
-    ) if indexed_valid_sequences else None
+        indexed_train_sequences = []
+        for seq in train_sequences:
+            clone = dict(seq)
+            for idx, field in enumerate(prepared.sdoh_fields):
+                clone[f"sdoh_{idx}"] = clone[field]
+            indexed_train_sequences.append(clone)
+        indexed_valid_sequences = []
+        for seq in valid_sequences:
+            clone = dict(seq)
+            for idx, field in enumerate(prepared.sdoh_fields):
+                clone[f"sdoh_{idx}"] = clone[field]
+            indexed_valid_sequences.append(clone)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    valid_loader = DataLoader(valid_ds, batch_size=args.batch_size, shuffle=False) if valid_ds is not None else None
+        train_ds = PatientSequenceDataset(
+            indexed_train_sequences,
+            max_seq_len=args.max_seq_len,
+            sdoh_fields=sdoh_inputs,
+            patient_context_fields=prepared.patient_context_fields,
+            patient_numeric_fields=prepared.patient_numeric_fields,
+            temporal_split=False,
+        )
+        valid_ds = (
+            PatientSequenceDataset(
+                indexed_valid_sequences,
+                max_seq_len=args.max_seq_len,
+                sdoh_fields=sdoh_inputs,
+                patient_context_fields=prepared.patient_context_fields,
+                patient_numeric_fields=prepared.patient_numeric_fields,
+                temporal_split=False,
+            )
+            if indexed_valid_sequences
+            else None
+        )
+
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+        valid_loader = DataLoader(valid_ds, batch_size=args.batch_size, shuffle=False) if valid_ds is not None else None
+        eval_loader = valid_loader
+        use_temporal = False
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = PatientEventSequenceModel(
@@ -739,10 +904,49 @@ def main() -> None:
     }
 
     history: list[dict[str, Any]] = []
+    top_k = max(1, int(args.top_k_accuracy))
+
     for epoch in range(1, args.epochs + 1):
-        train_metrics = run_epoch(model, train_loader, optimizer, device, weights)
-        valid_metrics = run_epoch(model, valid_loader, None, device, weights) if valid_loader is not None else None
-        record = {"epoch": epoch, "train": train_metrics, "valid": valid_metrics}
+        if use_temporal:
+            train_metrics = run_epoch(
+                model,
+                train_loader,
+                optimizer,
+                device,
+                weights,
+                temporal=True,
+                split_role_filter=SPLIT_TRAIN,
+            )
+            valid_metrics = run_epoch(
+                model,
+                eval_loader,
+                None,
+                device,
+                weights,
+                temporal=True,
+                split_role_filter=SPLIT_VAL,
+                compute_accuracy=True,
+                top_k=top_k,
+            )
+            test_metrics = run_epoch(
+                model,
+                eval_loader,
+                None,
+                device,
+                weights,
+                temporal=True,
+                split_role_filter=SPLIT_TEST,
+                compute_accuracy=True,
+                top_k=top_k,
+            )
+            record = {"epoch": epoch, "train": train_metrics, "valid": valid_metrics, "test": test_metrics}
+        else:
+            train_metrics = run_epoch(model, train_loader, optimizer, device, weights, temporal=False)
+            valid_metrics = (
+                run_epoch(model, valid_loader, None, device, weights, temporal=False) if valid_loader is not None else None
+            )
+            record = {"epoch": epoch, "train": train_metrics, "valid": valid_metrics, "test": None}
+
         history.append(record)
         print(json.dumps(record))
 
