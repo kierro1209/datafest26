@@ -1,0 +1,4 @@
+data/*
+rl/__pycache__/*
+rl/output/*
+rl/synthetic/*
