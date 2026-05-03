@@ -7,7 +7,7 @@ import logging
 import math
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -591,9 +591,20 @@ def _first_available(payloads: list[dict[str, Any]], key: str, default: Any = No
 
 
 def load_prepared_pt(input_path: Path, vocab_path: Path | None = None) -> PreparedData:
-    raw = torch.load(input_path, map_location="cpu")
+    log.info(
+        "Loading sequence artifact (large .pt files can take minutes before other logs appear): %s",
+        input_path.resolve(),
+    )
+    # Full prepared dicts require weights_only=False; use only on trusted local artifacts.
+    try:
+        raw = torch.load(input_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        raw = torch.load(input_path, map_location="cpu")
     if not isinstance(raw, dict) or "sequences" not in raw:
         raise SystemExit(f"Unexpected PT artifact format: {input_path}")
+
+    n_raw = len(raw.get("sequences") or [])
+    log.info("Deserialized %s raw sequence entries; loading vocab and building training sequences…", f"{n_raw:,}")
 
     vocab_payload = _load_vocab_payload(vocab_path or _companion_vocab_path(input_path))
     payloads = [raw, vocab_payload]
@@ -825,15 +836,17 @@ def _accumulate_accuracy_micro(
         m = position_mask & (targets != -100)
         if not m.any():
             continue
-        pred = logits.argmax(dim=1)
+        # Logits are (B, T, num_classes); argmax over class dim matches target (B, T).
+        pred = logits.argmax(dim=-1)
         correct = (pred == targets) & m
         ck = f"acc_{head_key}"
         correct_sum[ck] = correct_sum.get(ck, 0.0) + correct.sum().float().item()
         total_sum[ck] = total_sum.get(ck, 0.0) + m.sum().float().item()
-        if top_k > 1 and logits.size(1) >= top_k:
-            kk = min(top_k, logits.size(1))
-            _, topv = logits.topk(kk, dim=1)
-            hit = (topv == targets.unsqueeze(1)).any(dim=1) & m
+        n_cls = logits.size(-1)
+        if top_k > 1 and n_cls >= top_k:
+            kk = min(top_k, n_cls)
+            _, topv = logits.topk(kk, dim=-1)
+            hit = (topv == targets.unsqueeze(-1)).any(dim=-1) & m
             tk = f"top{top_k}_{head_key}"
             topk_correct_sum[tk] = topk_correct_sum.get(tk, 0.0) + hit.sum().float().item()
             total_sum[tk] = total_sum.get(tk, 0.0) + m.sum().float().item()
@@ -853,6 +866,7 @@ def run_epoch(
     top_k: int = 1,
     progress_desc: str | None = None,
     show_progress: bool = True,
+    log_batch_interval: int = 0,
 ) -> dict[str, float]:
     train_mode = optimizer is not None
     model.train(train_mode)
@@ -862,6 +876,7 @@ def run_epoch(
     topk_correct_sum: dict[str, float] = {}
     htm = head_to_target or HEAD_TO_TARGET
     batches = 0
+    running_total_loss = 0.0
     iterator: Iterable[Any] = loader
     total_batches = len(loader)
     use_tqdm = bool(show_progress and progress_desc and tqdm is not None and total_batches > 0)
@@ -896,6 +911,18 @@ def run_epoch(
             pm = batch["split_role"] == split_role_filter
             _accumulate_accuracy_micro(outputs, batch, pm, top_k, correct_sum, total_sum, topk_correct_sum, htm)
         batches += 1
+        mt = float(metrics.get("total", 0.0))
+        running_total_loss += mt
+        if log_batch_interval > 0 and batches % log_batch_interval == 0:
+            phase = progress_desc or ("train" if train_mode else "eval")
+            log.info(
+                "%s | batches %s/%s | running_mean_total_loss=%.6f | last_batch_total=%.6f",
+                phase,
+                batches,
+                total_batches,
+                running_total_loss / batches,
+                mt,
+            )
         if use_tqdm and hasattr(iterator, "set_postfix"):
             iterator.set_postfix(loss=f"{metrics.get('total', float('nan')):.4f}")
     elapsed = time.perf_counter() - t0
@@ -921,6 +948,29 @@ def run_epoch(
         mean_total,
     )
     return out
+
+
+def reset_incremental_metric_files(output_dir: Path) -> None:
+    """Start a fresh JSONL log for this training process."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    p = output_dir / "training_metrics.jsonl"
+    if p.exists():
+        p.unlink()
+
+
+def append_epoch_metrics_jsonl(output_dir: Path, record: dict[str, Any]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "training_metrics.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, default=str) + "\n")
+
+
+def save_training_history_snapshot(output_dir: Path, history: list[dict[str, Any]]) -> None:
+    """Full metrics list so far — safe to plot if training is interrupted."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "training_history_snapshot.json").write_text(
+        json.dumps(history, indent=2, default=str),
+        encoding="utf-8",
+    )
 
 
 def save_artifacts(output_dir: Path, prepared: PreparedData, model: nn.Module, history: list[dict[str, Any]], args: argparse.Namespace) -> None:
@@ -969,6 +1019,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-seq-len", type=int, default=128)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--epochs", type=int, default=10)
+    p.add_argument(
+        "--max-sequences",
+        type=int,
+        default=0,
+        help="If >0, train/eval only on the first N sequences after load (deterministic order). Use for smoke tests.",
+    )
+    p.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Fast pipeline check: caps sequences (128), epochs (3), batch size (16); writes to patient_event_model_smoke unless --output-dir set.",
+    )
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument(
         "--split-strategy",
@@ -1016,7 +1077,27 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level for human-readable lines (epoch summaries use log.info).",
     )
-    return p.parse_args()
+    p.add_argument(
+        "--log-batch-interval",
+        type=int,
+        default=50,
+        help="Within each train/valid/test pass: log running mean total loss every N batches (0 disables).",
+    )
+    p.add_argument(
+        "--no-incremental-metrics",
+        action="store_true",
+        help="Do not write training_metrics.jsonl or training_history_snapshot.json after each epoch.",
+    )
+    ns = p.parse_args()
+    _default_out = Path("data/processed/patient_event_model")
+    if ns.smoke_test:
+        if ns.max_sequences <= 0:
+            ns.max_sequences = 128
+        ns.epochs = 3
+        ns.batch_size = 16
+        if ns.output_dir == _default_out:
+            ns.output_dir = Path("data/processed/patient_event_model_smoke")
+    return ns
 
 
 def main() -> None:
@@ -1029,6 +1110,15 @@ def main() -> None:
     )
     if tqdm is None:
         log.warning("tqdm is not installed; batch-level progress bars disabled. pip install tqdm")
+
+    if args.smoke_test:
+        log.info(
+            "Smoke-test mode | max_sequences=%s epochs=%s batch_size=%s output_dir=%s",
+            args.max_sequences,
+            args.epochs,
+            args.batch_size,
+            args.output_dir,
+        )
 
     if not args.input.exists():
         raise SystemExit(f"Input not found: {args.input}")
@@ -1048,6 +1138,14 @@ def main() -> None:
     prepared = load_prepared_pt(args.input, args.vocab_json)
     if not prepared.sequences:
         raise SystemExit("No patient sequences with at least two events were found.")
+
+    if args.max_sequences > 0:
+        cap = min(len(prepared.sequences), args.max_sequences)
+        md = dict(prepared.metadata)
+        md["sequence_subset_cap"] = cap
+        md["sequence_subset_total_loaded"] = len(prepared.sequences)
+        prepared = replace(prepared, sequences=prepared.sequences[:cap], metadata=md)
+        log.info("Using %s sequences (--max-sequences %s).", cap, args.max_sequences)
 
     head_to_target = merge_head_to_target(prepared.external_stream_bases)
     external_vocab_sizes = {b: _mapping_size(prepared.external_to_id[b]) for b in prepared.external_stream_bases}
@@ -1227,6 +1325,15 @@ def main() -> None:
 
     history: list[dict[str, Any]] = []
     top_k = max(1, int(args.top_k_accuracy))
+    log_batch_iv = max(0, int(args.log_batch_interval))
+
+    if not args.no_incremental_metrics:
+        reset_incremental_metric_files(args.output_dir)
+        log.info(
+            "Incremental metrics: %s (one JSON object per epoch) and %s (full history after each epoch)",
+            args.output_dir / "training_metrics.jsonl",
+            args.output_dir / "training_history_snapshot.json",
+        )
 
     for epoch in range(1, args.epochs + 1):
         log.info("---------- Epoch %s / %s ----------", epoch, args.epochs)
@@ -1242,6 +1349,7 @@ def main() -> None:
                 split_role_filter=SPLIT_TRAIN,
                 progress_desc=f"[{epoch}/{args.epochs}] train",
                 show_progress=show_progress,
+                log_batch_interval=log_batch_iv,
             )
             valid_metrics = run_epoch(
                 model,
@@ -1256,6 +1364,7 @@ def main() -> None:
                 top_k=top_k,
                 progress_desc=f"[{epoch}/{args.epochs}] valid",
                 show_progress=show_progress,
+                log_batch_interval=log_batch_iv,
             )
             test_metrics = run_epoch(
                 model,
@@ -1270,6 +1379,7 @@ def main() -> None:
                 top_k=top_k,
                 progress_desc=f"[{epoch}/{args.epochs}] test",
                 show_progress=show_progress,
+                log_batch_interval=log_batch_iv,
             )
             record = {"epoch": epoch, "train": train_metrics, "valid": valid_metrics, "test": test_metrics}
             log.info(
@@ -1291,6 +1401,7 @@ def main() -> None:
                 temporal=False,
                 progress_desc=f"[{epoch}/{args.epochs}] train",
                 show_progress=show_progress,
+                log_batch_interval=log_batch_iv,
             )
             valid_metrics = (
                 run_epoch(
@@ -1303,6 +1414,7 @@ def main() -> None:
                     temporal=False,
                     progress_desc=f"[{epoch}/{args.epochs}] valid",
                     show_progress=show_progress,
+                    log_batch_interval=log_batch_iv,
                 )
                 if valid_loader is not None
                 else None
@@ -1319,6 +1431,11 @@ def main() -> None:
 
         history.append(record)
         print(json.dumps(record), flush=True)
+
+        if not args.no_incremental_metrics:
+            append_epoch_metrics_jsonl(args.output_dir, record)
+            save_training_history_snapshot(args.output_dir, history)
+            log.info("Wrote incremental metrics (%s epochs in snapshot)", len(history))
 
     save_artifacts(args.output_dir, prepared, model, history, args)
     log.info("Saved artifacts to %s", args.output_dir.resolve())

@@ -57,9 +57,11 @@ python modelling/train_patient_event_model.py \
 ### Outputs (`--output-dir`)
 
 - `patient_event_model.pt` — checkpoint and args  
-- `patient_event_model_artifacts.json` — vocab copies, metadata, training history  
+- `patient_event_model_artifacts.json` — vocab copies, metadata, full **`training_history`** (written once training completes)
 
-Epoch logs include `train`, `valid`, and under temporal split also `test`.
+**During training** (unless `--no-incremental-metrics`): **`training_metrics.jsonl`** appends one JSON object per epoch (same shape as stdout lines), and **`training_history_snapshot.json`** is overwritten each epoch with all epochs so far — useful if a run is interrupted. **`--log-batch-interval N`** (default `50`) logs running mean total loss every `N` batches within train/valid/test passes; set **`0`** to disable that intra-phase spam.
+
+Epoch stdout logs include `train`, `valid`, and under temporal split also `test`.
 
 ### Exporting per-timestep predictions
 
