@@ -1,17 +1,30 @@
 #!/usr/bin/env python3
-"""Export per-timestep predictions from a trained patient event model checkpoint."""
+"""Export per-timestep predictions from a trained patient event model checkpoint.
+
+Supports:
+- Auto-discovering latest checkpoint under data/processed or DATA/processed.
+- Long format (one row per head/timestep) or wide WHAT/WHEN/WHERE format.
+"""
 from __future__ import annotations
 
 import argparse
 import csv
 import gzip
 import json
+import logging
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch.utils.data import DataLoader
+try:
+    from tqdm import tqdm
+
+    _HAS_TQDM = True
+except Exception:
+    _HAS_TQDM = False
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -31,6 +44,21 @@ from modelling.train_patient_event_model import (  # noqa: E402
     load_prepared_pt,
     split_sequences,
 )
+
+CORE_HEADS: tuple[str, ...] = (
+    "type",
+    "event_description",
+    "group_code",
+    "diagnosis_value",
+    "gap",
+    "setting",
+    "dept_type",
+    "dept_specialty",
+    "facility_size",
+    "region",
+)
+
+logger = logging.getLogger("infer_patient_event_model")
 
 
 class PatientSequenceDatasetWithPatientId(PatientSequenceDataset):
@@ -128,16 +156,58 @@ def _merge_args_with_checkpoint(ckpt: dict[str, Any]) -> argparse.Namespace:
     return argparse.Namespace(**merged)
 
 
+def _default_model_dirs() -> list[Path]:
+    return [
+        _REPO_ROOT / "data/processed/patient_event_model",
+        _REPO_ROOT / "DATA/processed/patient_event_model",
+    ]
+
+
+def _discover_latest_checkpoint() -> Path:
+    candidates: list[Path] = []
+    for d in _default_model_dirs():
+        if not d.exists():
+            continue
+        for name in ("checkpoint_last.pt", "patient_event_model.pt"):
+            p = d / name
+            if p.exists():
+                candidates.append(p)
+    if not candidates:
+        raise SystemExit(
+            "No checkpoint found. Pass --checkpoint explicitly or place checkpoint_last.pt/patient_event_model.pt "
+            "under data/processed/patient_event_model (or DATA/processed/patient_event_model)."
+        )
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run inference and export per-timestep predictions to CSV.")
-    p.add_argument("--checkpoint", type=Path, required=True, help="Path to patient_event_model.pt from training.")
+    p.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="Checkpoint .pt. If omitted, auto-picks latest checkpoint_last.pt/patient_event_model.pt.",
+    )
     p.add_argument("--input", type=Path, default=None, help="Sequence .pt (default: training args in checkpoint).")
     p.add_argument("--vocab-json", type=Path, default=None, help="Vocab JSON (default: training args in checkpoint).")
     p.add_argument(
         "--output",
         type=Path,
-        default=Path("data/processed/patient_event_model/predictions_export.csv.gz"),
+        default=None,
         help="Output CSV path (.csv or .csv.gz).",
+    )
+    p.add_argument(
+        "--output-format",
+        choices=["long", "wide"],
+        default="wide",
+        help="long: one row per head/timestep; wide: one row per timestep with WHAT/WHEN/WHERE columns.",
+    )
+    p.add_argument(
+        "--heads",
+        type=str,
+        default=",".join(CORE_HEADS),
+        help="Comma-separated heads to export (default: core WHAT/WHEN/WHERE heads).",
     )
     p.add_argument(
         "--split",
@@ -153,6 +223,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable memory-mapped load for the sequence .pt (same as training).",
     )
+    p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    p.add_argument(
+        "--log-every-batches",
+        type=int,
+        default=20,
+        help="When tqdm is unavailable, print progress every N batches.",
+    )
     return p.parse_args()
 
 
@@ -164,22 +241,46 @@ def _open_text(path: Path):
 
 def export_predictions() -> None:
     args = parse_args()
+    logging.basicConfig(
+        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    t0 = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt_path = args.checkpoint
+    logger.info("Device: %s", device)
+    ckpt_path = args.checkpoint.expanduser().resolve() if args.checkpoint else _discover_latest_checkpoint()
     if not ckpt_path.exists():
         raise SystemExit(f"Checkpoint not found: {ckpt_path}")
+    logger.info("Checkpoint: %s", ckpt_path)
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     train_args = _merge_args_with_checkpoint(ckpt)
 
     input_pt = args.input or Path(train_args.input)
     vocab_json = args.vocab_json if args.vocab_json is not None else Path(train_args.vocab_json)
+    logger.info("Input sequences: %s", input_pt)
+    logger.info("Vocab JSON: %s", vocab_json)
 
     prepared = load_prepared_pt(input_pt, vocab_json, mmap_load=not args.no_mmap_load)
     if not prepared.sequences:
         raise SystemExit("No sequences loaded.")
+    logger.info(
+        "Loaded prepared data: sequences=%s external_streams=%s sdoh_streams=%s",
+        f"{len(prepared.sequences):,}",
+        len(prepared.external_stream_bases),
+        len(prepared.sdoh_fields),
+    )
 
-    head_to_target = merge_head_to_target(prepared.external_stream_bases)
+    head_to_target_all = merge_head_to_target(prepared.external_stream_bases)
+    wanted = [h.strip() for h in args.heads.split(",") if h.strip()]
+    if not wanted:
+        raise SystemExit("No heads selected. Pass --heads with at least one head.")
+    unknown = [h for h in wanted if h not in head_to_target_all]
+    if unknown:
+        raise SystemExit(f"Unknown heads in --heads: {unknown}. Available: {sorted(head_to_target_all.keys())}")
+    head_to_target = {h: head_to_target_all[h] for h in wanted}
+    logger.info("Heads selected (%d): %s", len(head_to_target), ", ".join(head_to_target.keys()))
     label_maps = _head_vocab_maps(prepared) if args.decode_labels else {}
 
     model = _instantiate_model(prepared, train_args).to(device)
@@ -233,27 +334,53 @@ def export_predictions() -> None:
         shuffle=False,
         collate_fn=collate_with_patient_id,
     )
+    logger.info(
+        "Dataset ready: samples=%s batches=%s batch_size=%s split=%s format=%s decode_labels=%s",
+        f"{len(ds):,}",
+        f"{len(loader):,}",
+        args.batch_size,
+        args.split,
+        args.output_format,
+        args.decode_labels,
+    )
 
-    fieldnames = [
-        "patient_id",
-        "timestep",
-        "temporal_split_region",
-        "head",
-        "target_id",
-        "predicted_id",
-        "correct",
-    ]
-    if args.decode_labels:
-        fieldnames.extend(["target_label", "predicted_label"])
+    if args.output is None:
+        default_name = "predictions_what_when_where_wide.csv.gz" if args.output_format == "wide" else "predictions_export_long.csv.gz"
+        args.output = ckpt_path.parent / default_name
+
+    if args.output_format == "long":
+        fieldnames = [
+            "patient_id",
+            "timestep",
+            "temporal_split_region",
+            "head",
+            "target_id",
+            "predicted_id",
+            "correct",
+        ]
+        if args.decode_labels:
+            fieldnames.extend(["target_label", "predicted_label"])
+    else:
+        fieldnames = ["patient_id", "timestep", "temporal_split_region"]
+        for head in head_to_target:
+            fieldnames.extend([f"target_{head}_id", f"predicted_{head}_id", f"correct_{head}"])
+            if args.decode_labels:
+                fieldnames.extend([f"target_{head}_label", f"predicted_{head}_label"])
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("Output: %s", args.output.resolve())
     rows_written = 0
+    batch_iter = loader
+    if _HAS_TQDM:
+        batch_iter = tqdm(loader, total=len(loader), desc="Inference", unit="batch")
+    batches_done = 0
     with _open_text(args.output) as fh:
         w = csv.DictWriter(fh, fieldnames=fieldnames)
         w.writeheader()
 
         with torch.no_grad():
-            for batch in loader:
+            for batch in batch_iter:
+                batches_done += 1
                 pids = batch.pop("patient_id")
                 batch_tensors = {k: v.to(device) for k, v in batch.items()}
                 outputs = model(batch_tensors)
@@ -289,39 +416,100 @@ def export_predictions() -> None:
                         else:
                             region = "valid_patient_holdout"
 
-                        for head, suffix in head_to_target.items():
-                            tgt = batch_tensors[f"target_{suffix}"][b, t].item()
-                            if tgt == -100:
-                                continue
-                            logits = outputs[head][b, t]
-                            pred = int(logits.argmax(dim=-1).item())
+                        if args.output_format == "long":
+                            for head, suffix in head_to_target.items():
+                                tgt = int(batch_tensors[f"target_{suffix}"][b, t].item())
+                                if tgt == -100:
+                                    continue
+                                logits = outputs[head][b, t]
+                                pred = int(logits.argmax(dim=-1).item())
+                                row = {
+                                    "patient_id": pid,
+                                    "timestep": t,
+                                    "temporal_split_region": region,
+                                    "head": head,
+                                    "target_id": tgt,
+                                    "predicted_id": pred,
+                                    "correct": int(pred == tgt),
+                                }
+                                if args.decode_labels:
+                                    lm = label_maps.get(head, {})
+                                    row["target_label"] = lm.get(tgt, "")
+                                    row["predicted_label"] = lm.get(pred, "")
+                                w.writerow(row)
+                                rows_written += 1
+                                if args.max_rows and rows_written >= args.max_rows:
+                                    if _HAS_TQDM:
+                                        tqdm.write(f"Stopped at max_rows={args.max_rows:,}")
+                                    print(
+                                        json.dumps(
+                                            {
+                                                "status": "stopped_max_rows",
+                                                "rows_written": rows_written,
+                                                "output": str(args.output.resolve()),
+                                            },
+                                            indent=2,
+                                        )
+                                    )
+                                    return
+                        else:
                             row = {
                                 "patient_id": pid,
                                 "timestep": t,
                                 "temporal_split_region": region,
-                                "head": head,
-                                "target_id": tgt,
-                                "predicted_id": pred,
-                                "correct": int(pred == tgt),
                             }
-                            if args.decode_labels:
-                                lm = label_maps.get(head, {})
-                                row["target_label"] = lm.get(int(tgt), "")
-                                row["predicted_label"] = lm.get(int(pred), "")
-                            w.writerow(row)
-                            rows_written += 1
-                            if args.max_rows and rows_written >= args.max_rows:
-                                print(
-                                    json.dumps(
-                                        {
-                                            "status": "stopped_max_rows",
-                                            "rows_written": rows_written,
-                                            "output": str(args.output.resolve()),
-                                        },
-                                        indent=2,
+                            wrote_any = False
+                            for head, suffix in head_to_target.items():
+                                tgt = int(batch_tensors[f"target_{suffix}"][b, t].item())
+                                if tgt == -100:
+                                    row[f"target_{head}_id"] = ""
+                                    row[f"predicted_{head}_id"] = ""
+                                    row[f"correct_{head}"] = ""
+                                    if args.decode_labels:
+                                        row[f"target_{head}_label"] = ""
+                                        row[f"predicted_{head}_label"] = ""
+                                    continue
+                                pred = int(outputs[head][b, t].argmax(dim=-1).item())
+                                row[f"target_{head}_id"] = tgt
+                                row[f"predicted_{head}_id"] = pred
+                                row[f"correct_{head}"] = int(pred == tgt)
+                                if args.decode_labels:
+                                    lm = label_maps.get(head, {})
+                                    row[f"target_{head}_label"] = lm.get(tgt, "")
+                                    row[f"predicted_{head}_label"] = lm.get(pred, "")
+                                wrote_any = True
+                            if wrote_any:
+                                w.writerow(row)
+                                rows_written += 1
+                                if args.max_rows and rows_written >= args.max_rows:
+                                    print(
+                                        json.dumps(
+                                            {
+                                                "status": "stopped_max_rows",
+                                                "rows_written": rows_written,
+                                                "output": str(args.output.resolve()),
+                                            },
+                                            indent=2,
+                                        )
                                     )
-                                )
-                                return
+                                    return
+                        if (not _HAS_TQDM) and args.log_every_batches > 0 and (batches_done % args.log_every_batches == 0):
+                            logger.info(
+                                "Progress: batches=%s/%s rows_written=%s",
+                                f"{batches_done:,}",
+                                f"{len(loader):,}",
+                                f"{rows_written:,}",
+                            )
+                if _HAS_TQDM and hasattr(batch_iter, "set_postfix"):
+                    batch_iter.set_postfix(rows=f"{rows_written:,}")
+
+    elapsed = time.time() - t0
+    logger.info(
+        "Inference complete: batches=%s rows=%s elapsed=%.1fs",
+        f"{batches_done:,}",
+        f"{rows_written:,}",
+        elapsed,
+    )
 
     print(
         json.dumps(
@@ -331,6 +519,8 @@ def export_predictions() -> None:
                 "output": str(args.output.resolve()),
                 "checkpoint": str(ckpt_path.resolve()),
                 "split_filter": args.split if temporal else "all_holdout_valid",
+                "output_format": args.output_format,
+                "heads": list(head_to_target.keys()),
             },
             indent=2,
         )
