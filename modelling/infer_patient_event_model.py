@@ -148,6 +148,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--max-rows", type=int, default=0, help="Stop after this many CSV rows (0 = no limit).")
     p.add_argument("--decode-labels", action="store_true", help="Add human-readable label columns using vocab maps.")
+    p.add_argument(
+        "--no-mmap-load",
+        action="store_true",
+        help="Disable memory-mapped load for the sequence .pt (same as training).",
+    )
     return p.parse_args()
 
 
@@ -170,7 +175,7 @@ def export_predictions() -> None:
     input_pt = args.input or Path(train_args.input)
     vocab_json = args.vocab_json if args.vocab_json is not None else Path(train_args.vocab_json)
 
-    prepared = load_prepared_pt(input_pt, vocab_json)
+    prepared = load_prepared_pt(input_pt, vocab_json, mmap_load=not args.no_mmap_load)
     if not prepared.sequences:
         raise SystemExit("No sequences loaded.")
 

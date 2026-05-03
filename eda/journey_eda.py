@@ -215,9 +215,9 @@ def load_encounters(
     return df
 
 
-def add_next_event_columns(df: pd.DataFrame) -> pd.DataFrame:
+def add_next_event_columns(df: pd.DataFrame, *, inplace: bool = False) -> pd.DataFrame:
     """Per patient, shift core fields to obtain next encounter."""
-    out = df.copy()
+    out = df if inplace else df.copy()
     g = out.groupby("PatientDurableKey", sort=False)
     shift_cols = [
         ("event_datetime", "next_event_datetime"),
@@ -253,9 +253,16 @@ def add_next_event_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def filter_eda_rows(
-    df: pd.DataFrame, max_gap_days: int | None
+    df: pd.DataFrame,
+    max_gap_days: int | None,
+    columns: list[str] | None = None,
 ) -> pd.DataFrame:
-    eda = df[df["next_event_datetime"].notna()].copy()
+    """Optional ``columns`` returns a slim copy (lower memory for downstream EDA)."""
+    mask = df["next_event_datetime"].notna()
+    if columns is not None:
+        eda = df.loc[mask, columns].copy()
+    else:
+        eda = df.loc[mask].copy()
     eda = eda[eda["days_to_next_int"].notna()]
     eda = eda[eda["days_to_next_int"].astype(float) >= 0]
     if max_gap_days is not None:
