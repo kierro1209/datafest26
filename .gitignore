@@ -21,6 +21,10 @@ data/interim/*.sqlite-shm
 
 external_data/raw/*
 external_data/__pycache__/*
+external_data/datasets/*
+external_data/census_rel2020_blkgrp/*
+token_sequence_model/__pycache__/*
+*.gz
 *.pt
 *.csv
 *.json
@@ -35,3 +39,6 @@ external_data/__pycache__/*
 *.jsonl.lzma
 *.zip
 *.gz
+
+# Tracked token schema (exception to *.json)
+!token_sequence_model/final_token_format.json
