@@ -3,17 +3,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import random
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None  # type: ignore[assignment, misc]
+
+log = logging.getLogger(__name__)
 
 SPECIAL_TOKENS = {
     "[PAD]": 0,
@@ -42,6 +51,12 @@ class PreparedData:
     patient_context_fields: list[str]
     patient_numeric_fields: list[str]
     metadata: dict[str, Any]
+    # Optional per-timestep streams beyond core WHAT/WHEN/WHERE (e.g. census / market bins).
+    external_stream_bases: list[str] = field(default_factory=list)
+    external_to_id: dict[str, dict[str, int]] = field(default_factory=dict)
+    # Per-timestep float vector (e.g. ZHVI, ADI, FCC, NIBRS) from final_token_format companion PT.
+    external_per_token_dim: int = 0
+    external_feature_key: str = "external_feature_tensor"
 
 
 # Per-target-timestep roles for temporal split (aligned with target_* tensors).
@@ -63,10 +78,54 @@ HEAD_TO_TARGET: dict[str, str] = {
     "region": "region",
 }
 
+CANONICAL_STREAM_ID_KEYS = frozenset(
+    {
+        "type_ids",
+        "event_description_ids",
+        "group_code_ids",
+        "diagnosis_value_ids",
+        "gap_ids",
+        "setting_ids",
+        "dept_type_ids",
+        "dept_specialty_ids",
+        "facility_size_ids",
+        "region_ids",
+    }
+)
+
+
+def merge_head_to_target(external_stream_bases: list[str]) -> dict[str, str]:
+    m = dict(HEAD_TO_TARGET)
+    for base in external_stream_bases:
+        m[base] = base
+    return m
+
+
+def discover_external_stream_bases(sample: dict[str, Any], sdoh_fields: list[str]) -> list[str]:
+    """Keys like `<base>_ids` with same length as `type_ids`, excluding core and SDOH streams."""
+    type_ids = sample.get("type_ids")
+    if not isinstance(type_ids, list) or len(type_ids) < 2:
+        return []
+    seq_len = len(type_ids)
+    sdoh_set = set(sdoh_fields)
+    bases: list[str] = []
+    for key, val in sample.items():
+        if key in CANONICAL_STREAM_ID_KEYS or key in sdoh_set:
+            continue
+        if not key.endswith("_ids"):
+            continue
+        if not isinstance(val, list) or len(val) != seq_len:
+            continue
+        base = key[: -len("_ids")]
+        if base:
+            bases.append(base)
+    return sorted(bases)
+
 
 def temporal_split_ends(seq_len: int, train_f: float, valid_f: float, test_f: float) -> tuple[int, int]:
     """Exclusive boundaries (end_train, end_val) on target indices [0, seq_len).
 
+    Indices are **event positions** along the (possibly `--max-seq-len`-truncated) timeline.
     Train targets index i in [0, end_train), val in [end_train, end_val), test in [end_val, seq_len).
     """
     if seq_len < 2:
@@ -112,6 +171,9 @@ class PatientSequenceDataset(Dataset):
         train_fraction: float = 0.7,
         valid_fraction: float = 0.15,
         test_fraction: float = 0.15,
+        external_stream_bases: list[str] | None = None,
+        external_per_token_dim: int = 0,
+        external_feature_key: str = "external_feature_tensor",
     ) -> None:
         self.sequences = sequences
         self.max_seq_len = max_seq_len
@@ -122,6 +184,9 @@ class PatientSequenceDataset(Dataset):
         self.train_fraction = train_fraction
         self.valid_fraction = valid_fraction
         self.test_fraction = test_fraction
+        self.external_stream_bases = list(external_stream_bases or [])
+        self.external_per_token_dim = int(external_per_token_dim)
+        self.external_feature_key = external_feature_key
 
     def __len__(self) -> int:
         return len(self.sequences)
@@ -158,6 +223,14 @@ class PatientSequenceDataset(Dataset):
             values = list(seq.get(field, []))[: self.max_seq_len]
             sdoh_inputs[field] = [SPECIAL_TOKENS["[BOS]"]] + values[:-1]
 
+        external_inputs: dict[str, list[int]] = {}
+        external_targets: dict[str, list[int]] = {}
+        for base in self.external_stream_bases:
+            col = f"{base}_ids"
+            vals = list(seq.get(col, []))[: self.max_seq_len]
+            external_inputs[base] = [SPECIAL_TOKENS["[BOS]"]] + vals[:-1]
+            external_targets[base] = vals
+
         patient_context_ids = seq.get("patient_context_ids", {}) or {}
         patient_context_values = seq.get("patient_context_values", {}) or {}
         static_context_ids = [int(patient_context_ids.get(field, 0)) + len(SPECIAL_TOKENS) for field in self.patient_context_fields]
@@ -183,6 +256,9 @@ class PatientSequenceDataset(Dataset):
             input_region_ids += [SPECIAL_TOKENS["[PAD]"]] * pad_n
             for field in self.sdoh_fields:
                 sdoh_inputs[field] += [SPECIAL_TOKENS["[PAD]"]] * pad_n
+            for base in self.external_stream_bases:
+                external_inputs[base] += [SPECIAL_TOKENS["[PAD]"]] * pad_n
+                external_targets[base] += [-100] * pad_n
             type_ids += [-100] * pad_n
             event_description_ids += [-100] * pad_n
             group_code_ids += [-100] * pad_n
@@ -205,6 +281,12 @@ class PatientSequenceDataset(Dataset):
                     split_role[i] = SPLIT_VAL
                 else:
                     split_role[i] = SPLIT_TEST
+
+        ext_rows: list[list[float]] | None = None
+        if self.external_per_token_dim > 0:
+            ext_rows = _external_rows_to_matrix(seq.get(self.external_feature_key), seq_len, self.external_per_token_dim)
+            if pad_n > 0:
+                ext_rows += [[0.0] * self.external_per_token_dim for _ in range(pad_n)]
 
         batch = {
             "input_type_ids": torch.tensor(input_type_ids, dtype=torch.long),
@@ -235,6 +317,11 @@ class PatientSequenceDataset(Dataset):
             batch["split_role"] = torch.tensor(split_role, dtype=torch.long)
         for field in self.sdoh_fields:
             batch[f"input_{field}"] = torch.tensor(sdoh_inputs[field], dtype=torch.long)
+        for base in self.external_stream_bases:
+            batch[f"input_{base}_ids"] = torch.tensor(external_inputs[base], dtype=torch.long)
+            batch[f"target_{base}"] = torch.tensor(external_targets[base], dtype=torch.long)
+        if ext_rows is not None:
+            batch[self.external_feature_key] = torch.tensor(ext_rows, dtype=torch.float32)
         return batch
 
 
@@ -276,10 +363,18 @@ class PatientEventSequenceModel(nn.Module):
         n_layers: int,
         dropout: float,
         pad_token_id: int,
+        external_stream_bases: list[str] | None = None,
+        external_vocab_sizes: dict[str, int] | None = None,
+        external_per_token_dim: int = 0,
+        external_feature_key: str = "external_feature_tensor",
     ) -> None:
         super().__init__()
         self.backbone_name = backbone
         self.pad_token_id = pad_token_id
+        self.external_stream_bases = list(external_stream_bases or [])
+        ev = external_vocab_sizes or {}
+        self.external_per_token_dim = int(external_per_token_dim)
+        self.external_feature_batch_key = external_feature_key
         self.type_embedding = nn.Embedding(type_size, d_model, padding_idx=pad_token_id)
         self.event_description_embedding = nn.Embedding(event_description_size, d_model, padding_idx=pad_token_id)
         self.group_code_embedding = nn.Embedding(group_code_size, d_model, padding_idx=pad_token_id)
@@ -297,6 +392,9 @@ class PatientEventSequenceModel(nn.Module):
             nn.Embedding(vocab_size, d_model, padding_idx=0) for vocab_size in patient_context_vocab_sizes
         )
         self.patient_numeric_projection = nn.Linear(patient_numeric_dim, d_model) if patient_numeric_dim > 0 else None
+        self.external_per_token_proj = (
+            nn.Linear(self.external_per_token_dim, d_model) if self.external_per_token_dim > 0 else None
+        )
         self.positional = PositionalEncoding(d_model=d_model, max_len=max_seq_len)
         self.dropout = nn.Dropout(dropout)
 
@@ -337,6 +435,12 @@ class PatientEventSequenceModel(nn.Module):
         self.dept_specialty_head = nn.Linear(d_model, dept_specialty_size)
         self.facility_size_head = nn.Linear(d_model, facility_size_size)
         self.region_head = nn.Linear(d_model, region_size)
+        self.external_embeddings = nn.ModuleDict()
+        self.external_heads = nn.ModuleDict()
+        for base in self.external_stream_bases:
+            sz = ev[base]
+            self.external_embeddings[base] = nn.Embedding(sz, d_model, padding_idx=pad_token_id)
+            self.external_heads[base] = nn.Linear(d_model, sz)
 
     def _causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         mask = torch.full((seq_len, seq_len), float("-inf"), device=device)
@@ -353,6 +457,8 @@ class PatientEventSequenceModel(nn.Module):
         x = x + self.dept_specialty_embedding(batch["input_dept_specialty_ids"])
         x = x + self.facility_size_embedding(batch["input_facility_size_ids"])
         x = x + self.region_embedding(batch["input_region_ids"])
+        for base in self.external_stream_bases:
+            x = x + self.external_embeddings[base](batch[f"input_{base}_ids"])
         for idx, embedding in enumerate(self.sdoh_embeddings):
             x = x + embedding(batch[f"input_sdoh_{idx}"])
         if len(self.patient_context_embeddings) > 0:
@@ -363,6 +469,8 @@ class PatientEventSequenceModel(nn.Module):
         if self.patient_numeric_projection is not None:
             numeric_embed = self.patient_numeric_projection(batch["static_numeric_values"])
             x = x + numeric_embed.unsqueeze(1)
+        if self.external_per_token_proj is not None and self.external_feature_batch_key in batch:
+            x = x + self.external_per_token_proj(batch[self.external_feature_batch_key])
         x = self.positional(x)
         x = self.dropout(x)
 
@@ -374,7 +482,7 @@ class PatientEventSequenceModel(nn.Module):
         else:
             hidden, _ = self.backbone(x)
 
-        return {
+        out: dict[str, torch.Tensor] = {
             "type": self.type_head(hidden),
             "event_description": self.event_description_head(hidden),
             "group_code": self.group_code_head(hidden),
@@ -386,6 +494,9 @@ class PatientEventSequenceModel(nn.Module):
             "facility_size": self.facility_size_head(hidden),
             "region": self.region_head(hidden),
         }
+        for base in self.external_stream_bases:
+            out[base] = self.external_heads[base](hidden)
+        return out
 
 
 def _pad_mapping(mapping: Any) -> dict[str, int]:
@@ -426,6 +537,8 @@ def _infer_patient_context_vocab_sizes(patient_context_to_id: dict[str, Any], fi
 
 def _companion_vocab_path(input_path: Path) -> Path:
     name = input_path.name
+    if name == "patient_sequences_with_external_features.pt":
+        return input_path.with_name("final_token_format.json")
     if name.startswith("patient_sequences_") and name.endswith(".pt"):
         suffix = name[len("patient_sequences_") : -len(".pt")]
         return input_path.with_name(f"sequence_model_vocab_{suffix}.json")
@@ -438,10 +551,42 @@ def _load_vocab_payload(vocab_path: Path) -> dict[str, Any]:
     return json.loads(vocab_path.read_text(encoding="utf-8"))
 
 
+def _external_rows_to_matrix(raw: Any, seq_len: int, ext_dim: int) -> list[list[float]]:
+    """Convert sequence-level external_feature_tensor payload to ``seq_len`` rows of length ``ext_dim``."""
+    out = [[0.0] * ext_dim for _ in range(seq_len)]
+    if raw is None or ext_dim <= 0 or seq_len <= 0:
+        return out
+    if isinstance(raw, torch.Tensor):
+        t = raw.detach().float().cpu()
+        if t.dim() == 2 and t.size(-1) == ext_dim:
+            for i in range(min(seq_len, t.size(0))):
+                for j in range(ext_dim):
+                    out[i][j] = float(t[i, j].item())
+        return out
+    if isinstance(raw, list):
+        for i in range(min(seq_len, len(raw))):
+            row = raw[i]
+            if isinstance(row, torch.Tensor):
+                row = row.flatten().tolist()
+            if isinstance(row, (list, tuple)):
+                for j in range(min(ext_dim, len(row))):
+                    try:
+                        out[i][j] = float(row[j])
+                    except (TypeError, ValueError):
+                        pass
+    return out
+
+
 def _first_available(payloads: list[dict[str, Any]], key: str, default: Any = None) -> Any:
+    """Resolve a key from PT/vocab dicts, including nested ``metadata`` (as in ``final_token_format.json``)."""
     for payload in payloads:
-        if isinstance(payload, dict) and key in payload and payload[key] is not None:
+        if not isinstance(payload, dict):
+            continue
+        if key in payload and payload[key] is not None:
             return payload[key]
+        meta = payload.get("metadata")
+        if isinstance(meta, dict) and key in meta and meta[key] is not None:
+            return meta[key]
     return default
 
 
@@ -486,10 +631,35 @@ def load_prepared_pt(input_path: Path, vocab_path: Path | None = None) -> Prepar
             key for key in sample.keys() if key.startswith("sdoh_") and key.endswith("_latest_status_ids")
         )
     patient_context_fields = sorted((sample.get("patient_context_ids") or {}).keys())
-    numeric_candidates = ["patient_lat", "patient_lon", "patient_population"]
-    patient_numeric_fields = [
-        key for key in numeric_candidates if key in (sample.get("patient_context_values") or {})
-    ]
+    ctx_vals = sample.get("patient_context_values") or {}
+    numeric_from_vocab = _first_available(payloads, "patient_numeric_fields")
+    numeric_from_meta = _first_available(payloads, "patient_context_numeric_fields_found")
+    default_numeric = ["patient_lat", "patient_lon", "patient_population"]
+    if isinstance(numeric_from_vocab, list) and numeric_from_vocab:
+        patient_numeric_fields = [key for key in numeric_from_vocab if key in ctx_vals]
+    elif isinstance(numeric_from_meta, list) and numeric_from_meta:
+        patient_numeric_fields = [key for key in numeric_from_meta if key in ctx_vals]
+    else:
+        patient_numeric_fields = [key for key in default_numeric if key in ctx_vals]
+
+    has_ext_num = bool(_first_available(payloads, "has_external_numeric_features"))
+    external_feature_key = str(_first_available(payloads, "external_feature_tensor_sequence_key") or "external_feature_tensor")
+    external_per_token_dim = int(_first_available(payloads, "external_numeric_features_per_token_dim") or 0)
+    raw_ext = sample.get(external_feature_key)
+    if raw_ext is not None:
+        if isinstance(raw_ext, torch.Tensor) and raw_ext.dim() == 2:
+            if external_per_token_dim <= 0:
+                external_per_token_dim = int(raw_ext.size(-1))
+        elif isinstance(raw_ext, list) and raw_ext and isinstance(raw_ext[0], (list, tuple)):
+            if external_per_token_dim <= 0:
+                external_per_token_dim = len(raw_ext[0])
+    elif has_ext_num and external_per_token_dim <= 0:
+        external_per_token_dim = 20
+
+    external_stream_bases = discover_external_stream_bases(sample, sdoh_fields)
+    external_to_id: dict[str, dict[str, int]] = {}
+    for base in external_stream_bases:
+        external_to_id[base] = _pad_mapping(_first_available(payloads, f"{base}_to_id", {}))
 
     sequences: list[dict[str, Any]] = []
     for seq in sequences_raw:
@@ -530,6 +700,21 @@ def load_prepared_pt(input_path: Path, vocab_path: Path | None = None) -> Prepar
             prepared_seq[field] = values
             prepared_seq[f"sdoh_index::{field}"] = idx
             lengths.add(len(values))
+        skip_seq = False
+        for base in external_stream_bases:
+            key_ids = f"{base}_ids"
+            raw_list = seq.get(key_ids)
+            if not isinstance(raw_list, list):
+                skip_seq = True
+                break
+            values = _reindex_stream(list(raw_list), len(SPECIAL_TOKENS))
+            if len(values) != len(type_ids):
+                skip_seq = True
+                break
+            prepared_seq[key_ids] = values
+            lengths.add(len(values))
+        if skip_seq:
+            continue
         if len(lengths) != 1:
             continue
         sequences.append(prepared_seq)
@@ -551,6 +736,11 @@ def load_prepared_pt(input_path: Path, vocab_path: Path | None = None) -> Prepar
             "sdoh_stream_count": int(len(sdoh_fields)),
             "patient_context_field_count": int(len(patient_context_fields)),
             "patient_numeric_field_count": int(len(patient_numeric_fields)),
+            "external_stream_bases": list(external_stream_bases),
+            "external_stream_count": int(len(external_stream_bases)),
+            "external_per_token_dim": int(external_per_token_dim),
+            "external_feature_key": external_feature_key,
+            "has_external_numeric_tensor": bool(external_per_token_dim > 0),
         }
     )
 
@@ -572,6 +762,10 @@ def load_prepared_pt(input_path: Path, vocab_path: Path | None = None) -> Prepar
         patient_context_fields=patient_context_fields,
         patient_numeric_fields=patient_numeric_fields,
         metadata=metadata,
+        external_stream_bases=external_stream_bases,
+        external_to_id=external_to_id,
+        external_per_token_dim=external_per_token_dim,
+        external_feature_key=external_feature_key,
     )
 
 
@@ -591,11 +785,13 @@ def compute_losses(
     batch: dict[str, torch.Tensor],
     weights: dict[str, float],
     position_mask: torch.Tensor | None = None,
+    head_to_target: dict[str, str] | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Cross-entropy per head; if position_mask is set, average only over masked target steps."""
     ce = nn.CrossEntropyLoss(ignore_index=-100)
     per_head: dict[str, torch.Tensor] = {}
-    for head_key, target_suffix in HEAD_TO_TARGET.items():
+    htm = head_to_target or HEAD_TO_TARGET
+    for head_key, target_suffix in htm.items():
         logits = outputs[head_key].transpose(1, 2)
         targets = batch[f"target_{target_suffix}"]
         if position_mask is None:
@@ -621,8 +817,9 @@ def _accumulate_accuracy_micro(
     correct_sum: dict[str, float],
     total_sum: dict[str, float],
     topk_correct_sum: dict[str, float],
+    head_to_target: dict[str, str],
 ) -> None:
-    for head_key, target_suffix in HEAD_TO_TARGET.items():
+    for head_key, target_suffix in head_to_target.items():
         logits = outputs[head_key]
         targets = batch[f"target_{target_suffix}"]
         m = position_mask & (targets != -100)
@@ -649,10 +846,13 @@ def run_epoch(
     device: torch.device,
     weights: dict[str, float],
     *,
+    head_to_target: dict[str, str] | None = None,
     temporal: bool = False,
     split_role_filter: int | None = None,
     compute_accuracy: bool = False,
     top_k: int = 1,
+    progress_desc: str | None = None,
+    show_progress: bool = True,
 ) -> dict[str, float]:
     train_mode = optimizer is not None
     model.train(train_mode)
@@ -660,8 +860,23 @@ def run_epoch(
     correct_sum: dict[str, float] = {}
     total_sum: dict[str, float] = {}
     topk_correct_sum: dict[str, float] = {}
+    htm = head_to_target or HEAD_TO_TARGET
     batches = 0
-    for batch in loader:
+    iterator: Iterable[Any] = loader
+    total_batches = len(loader)
+    use_tqdm = bool(show_progress and progress_desc and tqdm is not None and total_batches > 0)
+    if use_tqdm:
+        iterator = tqdm(
+            loader,
+            total=total_batches,
+            desc=progress_desc,
+            leave=False,
+            unit="batch",
+            mininterval=0.3,
+            ncols=120,
+        )
+    t0 = time.perf_counter()
+    for batch in iterator:
         batch = {k: v.to(device) for k, v in batch.items()}
         position_mask: torch.Tensor | None = None
         if temporal:
@@ -669,7 +884,7 @@ def run_epoch(
             position_mask = batch["split_role"] == split_role_filter
         with torch.set_grad_enabled(train_mode):
             outputs = model(batch)
-            loss, metrics = compute_losses(outputs, batch, weights, position_mask)
+            loss, metrics = compute_losses(outputs, batch, weights, position_mask, head_to_target=htm)
             if train_mode:
                 optimizer.zero_grad()
                 loss.backward()
@@ -679,9 +894,14 @@ def run_epoch(
             totals[key] = totals.get(key, 0.0) + value
         if compute_accuracy and temporal and split_role_filter is not None:
             pm = batch["split_role"] == split_role_filter
-            _accumulate_accuracy_micro(outputs, batch, pm, top_k, correct_sum, total_sum, topk_correct_sum)
+            _accumulate_accuracy_micro(outputs, batch, pm, top_k, correct_sum, total_sum, topk_correct_sum, htm)
         batches += 1
+        if use_tqdm and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix(loss=f"{metrics.get('total', float('nan')):.4f}")
+    elapsed = time.perf_counter() - t0
+    label = progress_desc or ("train" if train_mode else "eval")
     if batches == 0:
+        log.warning("%s: no batches (empty loader)", label)
         return totals
     out = {key: value / batches for key, value in totals.items()}
     for ck, c in correct_sum.items():
@@ -692,6 +912,14 @@ def run_epoch(
         denom = total_sum.get(tk, 0.0)
         if denom > 0:
             out[tk] = c / denom
+    mean_total = out.get("total", float("nan"))
+    log.info(
+        "%s | batches=%d | wall_time=%.1fs | mean_total_loss=%.6f",
+        label,
+        batches,
+        elapsed,
+        mean_total,
+    )
     return out
 
 
@@ -715,15 +943,23 @@ def save_artifacts(output_dir: Path, prepared: PreparedData, model: nn.Module, h
         "sdoh_fields": prepared.sdoh_fields,
         "patient_context_fields": prepared.patient_context_fields,
         "patient_numeric_fields": prepared.patient_numeric_fields,
+        "external_stream_bases": prepared.external_stream_bases,
         "training_history": history,
     }
+    for base in prepared.external_stream_bases:
+        artifact[f"{base}_to_id"] = dict(prepared.external_to_id.get(base, {}))
     (output_dir / "patient_event_model_artifacts.json").write_text(json.dumps(artifact, indent=2), encoding="utf-8")
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train a multi-task autoregressive patient event sequence model.")
-    p.add_argument("--input", type=Path, default=Path("token_sequence_model/patient_sequences_encounter_only_with_sdoh_status_and_fips.pt"))
-    p.add_argument("--vocab-json", type=Path, default=Path("token_sequence_model/sequence_model_vocab_encounter_only_with_sdoh_status_and_fips.json"))
+    p.add_argument("--input", type=Path, default=Path("token_sequence_model/patient_sequences_with_external_features.pt"))
+    p.add_argument(
+        "--vocab-json",
+        type=Path,
+        default=Path("token_sequence_model/final_token_format.json"),
+        help="Full vocab + metadata (internal maps and external-feature specs); default matches patient_sequences_with_external_features.pt.",
+    )
     p.add_argument("--output-dir", type=Path, default=Path("data/processed/patient_event_model"))
     p.add_argument("--backbone", choices=["transformer", "gru", "lstm"], default="transformer")
     p.add_argument("--d-model", type=int, default=128)
@@ -762,12 +998,38 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--w-event-description", type=float, default=1.0)
     p.add_argument("--w-group-code", type=float, default=1.0)
     p.add_argument("--w-diagnosis-value", type=float, default=1.0)
+    p.add_argument(
+        "--w-external",
+        type=float,
+        default=1.0,
+        help="Loss weight for each auto-discovered external per-timestep stream (<base>_ids in the .pt).",
+    )
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm batch progress bars (still logs per-phase summaries).",
+    )
+    p.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level for human-readable lines (epoch summaries use log.info).",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+    if tqdm is None:
+        log.warning("tqdm is not installed; batch-level progress bars disabled. pip install tqdm")
+
     if not args.input.exists():
         raise SystemExit(f"Input not found: {args.input}")
     if args.vocab_json and not args.vocab_json.exists():
@@ -786,6 +1048,16 @@ def main() -> None:
     prepared = load_prepared_pt(args.input, args.vocab_json)
     if not prepared.sequences:
         raise SystemExit("No patient sequences with at least two events were found.")
+
+    head_to_target = merge_head_to_target(prepared.external_stream_bases)
+    external_vocab_sizes = {b: _mapping_size(prepared.external_to_id[b]) for b in prepared.external_stream_bases}
+    if prepared.external_stream_bases:
+        log.info(
+            "External categorical streams: %s",
+            json.dumps(
+                {"bases": prepared.external_stream_bases, "vocab_sizes": external_vocab_sizes},
+            ),
+        )
 
     sdoh_inputs = [f"sdoh_{idx}" for idx in range(len(prepared.sdoh_fields))]
 
@@ -811,6 +1083,9 @@ def main() -> None:
             train_fraction=tf,
             valid_fraction=vf,
             test_fraction=sf,
+            external_stream_bases=prepared.external_stream_bases,
+            external_per_token_dim=prepared.external_per_token_dim,
+            external_feature_key=prepared.external_feature_key,
         )
         train_loader = DataLoader(full_ds, batch_size=args.batch_size, shuffle=True)
         eval_loader = DataLoader(full_ds, batch_size=args.batch_size, shuffle=False)
@@ -842,6 +1117,9 @@ def main() -> None:
             patient_context_fields=prepared.patient_context_fields,
             patient_numeric_fields=prepared.patient_numeric_fields,
             temporal_split=False,
+            external_stream_bases=prepared.external_stream_bases,
+            external_per_token_dim=prepared.external_per_token_dim,
+            external_feature_key=prepared.external_feature_key,
         )
         valid_ds = (
             PatientSequenceDataset(
@@ -851,6 +1129,9 @@ def main() -> None:
                 patient_context_fields=prepared.patient_context_fields,
                 patient_numeric_fields=prepared.patient_numeric_fields,
                 temporal_split=False,
+                external_stream_bases=prepared.external_stream_bases,
+                external_per_token_dim=prepared.external_per_token_dim,
+                external_feature_key=prepared.external_feature_key,
             )
             if indexed_valid_sequences
             else None
@@ -861,7 +1142,31 @@ def main() -> None:
         eval_loader = valid_loader
         use_temporal = False
 
+    show_progress = not args.no_progress and tqdm is not None
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info(
+        "Run configuration | input=%s vocab=%s device=%s sequences=%s split=%s epochs=%s batch_size=%s lr=%s backbone=%s d_model=%s",
+        args.input,
+        args.vocab_json,
+        device,
+        f"{len(prepared.sequences):,}",
+        args.split_strategy,
+        args.epochs,
+        args.batch_size,
+        args.lr,
+        args.backbone,
+        args.d_model,
+    )
+    log.info(
+        "External per-token tensor dim=%s key=%s | SDOH streams=%s context_fields=%s numeric_fields=%s",
+        prepared.external_per_token_dim,
+        prepared.external_feature_key,
+        len(prepared.sdoh_fields),
+        len(prepared.patient_context_fields),
+        prepared.patient_numeric_fields,
+    )
+
     model = PatientEventSequenceModel(
         type_size=_mapping_size(prepared.type_to_id),
         event_description_size=_mapping_size(prepared.event_description_to_id),
@@ -887,7 +1192,15 @@ def main() -> None:
         n_layers=args.n_layers,
         dropout=args.dropout,
         pad_token_id=SPECIAL_TOKENS["[PAD]"],
+        external_stream_bases=prepared.external_stream_bases,
+        external_vocab_sizes=external_vocab_sizes,
+        external_per_token_dim=prepared.external_per_token_dim,
+        external_feature_key=prepared.external_feature_key,
     ).to(device)
+
+    n_params = sum(p.numel() for p in model.parameters())
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log.info("Model parameters: total=%s trainable=%s heads=%s", f"{n_params:,}", f"{n_trainable:,}", len(head_to_target))
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     weights = {
@@ -902,11 +1215,21 @@ def main() -> None:
         "facility_size": args.w_size,
         "region": args.w_region,
     }
+    for base in prepared.external_stream_bases:
+        weights[base] = args.w_external
+
+    log.info(
+        "DataLoaders | train_batches=%s eval_batches=%s (batch_size=%s)",
+        len(train_loader),
+        len(eval_loader) if eval_loader is not None else 0,
+        args.batch_size,
+    )
 
     history: list[dict[str, Any]] = []
     top_k = max(1, int(args.top_k_accuracy))
 
     for epoch in range(1, args.epochs + 1):
+        log.info("---------- Epoch %s / %s ----------", epoch, args.epochs)
         if use_temporal:
             train_metrics = run_epoch(
                 model,
@@ -914,8 +1237,11 @@ def main() -> None:
                 optimizer,
                 device,
                 weights,
+                head_to_target=head_to_target,
                 temporal=True,
                 split_role_filter=SPLIT_TRAIN,
+                progress_desc=f"[{epoch}/{args.epochs}] train",
+                show_progress=show_progress,
             )
             valid_metrics = run_epoch(
                 model,
@@ -923,10 +1249,13 @@ def main() -> None:
                 None,
                 device,
                 weights,
+                head_to_target=head_to_target,
                 temporal=True,
                 split_role_filter=SPLIT_VAL,
                 compute_accuracy=True,
                 top_k=top_k,
+                progress_desc=f"[{epoch}/{args.epochs}] valid",
+                show_progress=show_progress,
             )
             test_metrics = run_epoch(
                 model,
@@ -934,24 +1263,66 @@ def main() -> None:
                 None,
                 device,
                 weights,
+                head_to_target=head_to_target,
                 temporal=True,
                 split_role_filter=SPLIT_TEST,
                 compute_accuracy=True,
                 top_k=top_k,
+                progress_desc=f"[{epoch}/{args.epochs}] test",
+                show_progress=show_progress,
             )
             record = {"epoch": epoch, "train": train_metrics, "valid": valid_metrics, "test": test_metrics}
+            log.info(
+                "Epoch %s/%s done | train_loss=%.6f valid_loss=%.6f test_loss=%.6f",
+                epoch,
+                args.epochs,
+                train_metrics.get("total", float("nan")),
+                valid_metrics.get("total", float("nan")),
+                test_metrics.get("total", float("nan")),
+            )
         else:
-            train_metrics = run_epoch(model, train_loader, optimizer, device, weights, temporal=False)
+            train_metrics = run_epoch(
+                model,
+                train_loader,
+                optimizer,
+                device,
+                weights,
+                head_to_target=head_to_target,
+                temporal=False,
+                progress_desc=f"[{epoch}/{args.epochs}] train",
+                show_progress=show_progress,
+            )
             valid_metrics = (
-                run_epoch(model, valid_loader, None, device, weights, temporal=False) if valid_loader is not None else None
+                run_epoch(
+                    model,
+                    valid_loader,
+                    None,
+                    device,
+                    weights,
+                    head_to_target=head_to_target,
+                    temporal=False,
+                    progress_desc=f"[{epoch}/{args.epochs}] valid",
+                    show_progress=show_progress,
+                )
+                if valid_loader is not None
+                else None
             )
             record = {"epoch": epoch, "train": train_metrics, "valid": valid_metrics, "test": None}
+            vl = valid_metrics.get("total") if valid_metrics else None
+            log.info(
+                "Epoch %s/%s done | train_loss=%.6f valid_loss=%s",
+                epoch,
+                args.epochs,
+                train_metrics.get("total", float("nan")),
+                f"{vl:.6f}" if vl is not None else "n/a",
+            )
 
         history.append(record)
-        print(json.dumps(record))
+        print(json.dumps(record), flush=True)
 
     save_artifacts(args.output_dir, prepared, model, history, args)
-    print(json.dumps({"status": "done", "output_dir": str(args.output_dir), "metadata": prepared.metadata}, indent=2))
+    log.info("Saved artifacts to %s", args.output_dir.resolve())
+    print(json.dumps({"status": "done", "output_dir": str(args.output_dir), "metadata": prepared.metadata}, indent=2), flush=True)
 
 
 if __name__ == "__main__":
