@@ -395,7 +395,7 @@ def _enrich_loaded_encounter_frame(df: pd.DataFrame) -> pd.DataFrame:
     day = pd.to_datetime(df["Date"], format="%m/%d/%y", errors="coerce")
     if day.isna().all():
         day = pd.to_datetime(df["Date"], errors="coerce")
-    df["event_datetime"] = inst.fillna(day)
+    df["event_datetime"] = inst.fillna(day).dt.floor("D")
     _drop_optional_columns(df, ("Date", "AdmissionInstant"))
 
     logger.info("Sorting %s rows by patient and time...", f"{len(df):,}")
@@ -878,7 +878,8 @@ def run_all(args: argparse.Namespace) -> None:
     weekly = build_weekly_specialty(df)
     diag_provider = build_diag_provider_pressure(df)
 
-    eda = filter_eda_rows(df, args.max_gap_days, columns=EDA_SLIM_COLS)
+    eda = filter_eda_rows(df, args.max_gap_days)
+    eda = eda[EDA_SLIM_COLS].copy()
 
     del df
     gc.collect()
@@ -972,7 +973,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--input",
         type=Path,
-        default=_ROOT / "data/processed/event_enriched.csv.gz",
+        default=_ROOT / "data/processed/event_enriched.csv",
         help="Encounter-level CSV.gz.",
     )
     p.add_argument(

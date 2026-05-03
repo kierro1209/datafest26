@@ -338,9 +338,10 @@ def plot_04_heatmap(stress: pd.DataFrame, out: Path, *, max_specialties: int = 3
                 "label": "Stress score (rank-sum)\n↑ higher vs peers in grid",
                 "shrink": 0.55,
             },
-            xticklabels=x_labels,
-            yticklabels=y_labels,
         )
+
+        ax.set_xticklabels(x_labels, rotation=45, ha="center", fontsize=5)
+        ax.set_yticklabels(y_labels, fontsize=7)
     else:
         im = ax.imshow(pivot.values, aspect="auto", cmap="YlOrRd")
         ax.set_xticks(range(len(pivot.columns)))
@@ -355,7 +356,6 @@ def plot_04_heatmap(stress: pd.DataFrame, out: Path, *, max_specialties: int = 3
         "Relative resource pressure by specialty and month\n"
         "(composite rank score; descriptive only; unknown specialties omitted)"
     )
-    plt.setp(ax.get_xticklabels(), rotation=0, ha="center")
     fig.savefig(out)
     plt.close(fig)
 
