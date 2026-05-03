@@ -284,6 +284,9 @@ def plot_median_gap_by_group(eda: pd.DataFrame, out: Path, top_n: int = 20) -> N
 
 
 def plot_survival_style_returns(eda: pd.DataFrame, out: Path, top_n: int = 10) -> None:
+    eda = eda[
+        ~eda["GroupName_disp"].astype(str).str.lower().str.contains("missing")
+    ]
     vc = eda["GroupName_disp"].value_counts()
     top = vc.head(top_n).index
     sub = eda[eda["GroupName_disp"].isin(top)]
