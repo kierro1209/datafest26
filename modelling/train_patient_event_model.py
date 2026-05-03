@@ -6,6 +6,7 @@ import gc
 import json
 import logging
 import math
+import os
 import random
 import time
 from dataclasses import dataclass, field, replace
@@ -16,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset
 
 try:
@@ -208,6 +210,7 @@ class PatientSequenceDataset(Dataset):
         seq_len = len(type_ids)
         attention_mask = [1] * seq_len
 
+        # Causal alignment: at time t, inputs use BOS (t==0) or prior-step ids; targets[t] is the token to predict.
         input_type_ids = [SPECIAL_TOKENS["[BOS]"]] + type_ids[:-1]
         input_event_description_ids = [SPECIAL_TOKENS["[BOS]"]] + event_description_ids[:-1]
         input_group_code_ids = [SPECIAL_TOKENS["[BOS]"]] + group_code_ids[:-1]
@@ -396,6 +399,8 @@ class PatientEventSequenceModel(nn.Module):
         self.external_per_token_proj = (
             nn.Linear(self.external_per_token_dim, d_model) if self.external_per_token_dim > 0 else None
         )
+        # Sum of many embeddings has high variance; stabilize before backbone + heads.
+        self.embed_norm = nn.LayerNorm(d_model)
         self.positional = PositionalEncoding(d_model=d_model, max_len=max_seq_len)
         self.dropout = nn.Dropout(dropout)
 
@@ -407,6 +412,7 @@ class PatientEventSequenceModel(nn.Module):
                 dropout=dropout,
                 activation="gelu",
                 batch_first=True,
+                norm_first=True,
             )
             self.backbone = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         elif backbone == "gru":
@@ -444,8 +450,8 @@ class PatientEventSequenceModel(nn.Module):
             self.external_heads[base] = nn.Linear(d_model, sz)
 
     def _causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        mask = torch.full((seq_len, seq_len), float("-inf"), device=device)
-        return torch.triu(mask, diagonal=1)
+        # Bool tensor: True = cannot attend (future positions). Matches bool src_key_padding_mask (PyTorch 2.x).
+        return torch.triu(torch.ones((seq_len, seq_len), device=device, dtype=torch.bool), diagonal=1)
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         x = self.type_embedding(batch["input_type_ids"])
@@ -472,6 +478,7 @@ class PatientEventSequenceModel(nn.Module):
             x = x + numeric_embed.unsqueeze(1)
         if self.external_per_token_proj is not None and self.external_feature_batch_key in batch:
             x = x + self.external_per_token_proj(batch[self.external_feature_batch_key])
+        x = self.embed_norm(x)
         x = self.positional(x)
         x = self.dropout(x)
 
@@ -825,24 +832,72 @@ def split_sequences(sequences: list[dict[str, Any]], valid_fraction: float, rand
     return train, valid
 
 
+def _assert_logits_targets_aligned(
+    outputs: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    head_to_target: dict[str, str],
+) -> None:
+    """``outputs[head][b, t, :]`` predicts ``batch['target_*'][b, t]`` (same ``t`` as dataset targets).
+
+    The dataset builds ``input_*[:, t]`` as BOS (t=0) or the previous step's token so that the
+    causal stack at time ``t`` forecasts the current-step targets without an off-by-one.
+    """
+    for head_key, target_suffix in head_to_target.items():
+        if head_key not in outputs:
+            continue
+        logits = outputs[head_key]
+        tk = f"target_{target_suffix}"
+        if tk not in batch:
+            raise KeyError(f"Missing batch column {tk!r} for head {head_key!r}")
+        targets = batch[tk]
+        if logits.shape[:2] != targets.shape:
+            raise ValueError(
+                f"{head_key}: logits shape {tuple(logits.shape)} vs targets {tuple(targets.shape)} — "
+                "expected logits [batch, time, classes] and targets [batch, time]"
+            )
+
+
 def compute_losses(
     outputs: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
     weights: dict[str, float],
     position_mask: torch.Tensor | None = None,
     head_to_target: dict[str, str] | None = None,
+    label_smoothing: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Cross-entropy per head; if position_mask is set, average only over masked target steps."""
-    ce = nn.CrossEntropyLoss(ignore_index=-100)
-    per_head: dict[str, torch.Tensor] = {}
+    """Per-head cross-entropy.
+
+    ``F.cross_entropy(logits, targets)`` expects ``logits`` shaped ``[B, num_classes, T]``; we pass
+    ``outputs[head].transpose(1, 2)`` so class logits at ``[b, :, t]`` match integer target ``targets[b, t]``.
+
+    With ``position_mask`` (temporal split), loss is averaged only where the mask is True and
+    ``targets != -100`` (padding).
+    """
     htm = head_to_target or HEAD_TO_TARGET
+    _assert_logits_targets_aligned(outputs, batch, htm)
+    if position_mask is not None:
+        ref_shape = None
+        for _, suf in htm.items():
+            tk = f"target_{suf}"
+            if tk in batch:
+                ref_shape = batch[tk].shape
+                break
+        if ref_shape is not None and position_mask.shape != ref_shape:
+            raise ValueError(
+                f"position_mask shape {tuple(position_mask.shape)} != target shape {tuple(ref_shape)}"
+            )
+    ce = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=label_smoothing)
+    per_head: dict[str, torch.Tensor] = {}
+    ce_kw: dict[str, Any] = {"ignore_index": -100, "reduction": "none"}
+    if label_smoothing > 0.0:
+        ce_kw["label_smoothing"] = label_smoothing
     for head_key, target_suffix in htm.items():
         logits = outputs[head_key].transpose(1, 2)
         targets = batch[f"target_{target_suffix}"]
         if position_mask is None:
             per_head[head_key] = ce(logits, targets)
         else:
-            per_tok = F.cross_entropy(logits, targets, ignore_index=-100, reduction="none")
+            per_tok = F.cross_entropy(logits, targets, **ce_kw)
             m = position_mask & (targets != -100)
             if m.any():
                 per_head[head_key] = per_tok[m].mean()
@@ -886,6 +941,46 @@ def _accumulate_accuracy_micro(
             total_sum[tk] = total_sum.get(tk, 0.0) + m.sum().float().item()
 
 
+def _finalize_split_metrics(
+    totals: dict[str, float],
+    batches: int,
+    correct_sum: dict[str, float],
+    total_sum: dict[str, float],
+    topk_correct_sum: dict[str, float],
+) -> dict[str, float]:
+    """Merge batch-accumulated loss means with token-micro accuracy.
+
+    Per-head / total **CE** here is the mean of per-batch means (each batch’s loss is already
+    mean over **active tokens in that batch** for that head). Long and short sequences therefore
+    weight equally **per batch**, not per token. **acc_** / **topk_** keys are correct/total over
+    all active tokens in the pass (micro-averaged).
+    """
+    out = {key: totals[key] / batches for key in totals}
+    for ck, c in correct_sum.items():
+        denom = total_sum.get(ck, 0.0)
+        if denom > 0:
+            out[ck] = c / denom
+    for tk, c in topk_correct_sum.items():
+        denom = total_sum.get(tk, 0.0)
+        if denom > 0:
+            out[tk] = c / denom
+    return out
+
+
+def log_per_head_mean_ce(phase_label: str, metrics: dict[str, float], head_weight_order: list[str]) -> None:
+    """Log one line per phase with mean CE per head (same keys as loss weights) plus total."""
+    parts: list[str] = []
+    for hk in head_weight_order:
+        if hk in metrics:
+            parts.append(f"{hk}={metrics[hk]:.4f}")
+    log.info(
+        "%s | per-head mean CE: %s | total=%.6f",
+        phase_label,
+        " ".join(parts) if parts else "(no heads)",
+        metrics.get("total", float("nan")),
+    )
+
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -901,6 +996,8 @@ def run_epoch(
     progress_desc: str | None = None,
     show_progress: bool = True,
     log_batch_interval: int = 0,
+    label_smoothing: float = 0.0,
+    grad_clip: float = 1.0,
 ) -> dict[str, float]:
     train_mode = optimizer is not None
     model.train(train_mode)
@@ -933,11 +1030,19 @@ def run_epoch(
             position_mask = batch["split_role"] == split_role_filter
         with torch.set_grad_enabled(train_mode):
             outputs = model(batch)
-            loss, metrics = compute_losses(outputs, batch, weights, position_mask, head_to_target=htm)
+            loss, metrics = compute_losses(
+                outputs,
+                batch,
+                weights,
+                position_mask,
+                head_to_target=htm,
+                label_smoothing=label_smoothing,
+            )
             if train_mode:
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                if grad_clip and grad_clip > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
         for key, value in metrics.items():
             totals[key] = totals.get(key, 0.0) + value
@@ -964,15 +1069,7 @@ def run_epoch(
     if batches == 0:
         log.warning("%s: no batches (empty loader)", label)
         return totals
-    out = {key: value / batches for key, value in totals.items()}
-    for ck, c in correct_sum.items():
-        denom = total_sum.get(ck, 0.0)
-        if denom > 0:
-            out[ck] = c / denom
-    for tk, c in topk_correct_sum.items():
-        denom = total_sum.get(tk, 0.0)
-        if denom > 0:
-            out[tk] = c / denom
+    out = _finalize_split_metrics(totals, batches, correct_sum, total_sum, topk_correct_sum)
     mean_total = out.get("total", float("nan"))
     log.info(
         "%s | batches=%d | wall_time=%.1fs | mean_total_loss=%.6f",
@@ -982,6 +1079,113 @@ def run_epoch(
         mean_total,
     )
     return out
+
+
+def run_eval_temporal_val_test_combined(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    weights: dict[str, float],
+    *,
+    head_to_target: dict[str, str] | None = None,
+    top_k: int = 1,
+    progress_desc: str | None = None,
+    show_progress: bool = True,
+    log_batch_interval: int = 0,
+    label_smoothing: float = 0.0,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Single forward pass per batch; val and test losses use different split_role masks.
+
+    Cuts temporal eval compute roughly in half vs separate valid + test passes over the same loader.
+    """
+    model.eval()
+    htm = head_to_target or HEAD_TO_TARGET
+    totals_v: dict[str, float] = {}
+    totals_t: dict[str, float] = {}
+    correct_v: dict[str, float] = {}
+    total_v: dict[str, float] = {}
+    topkv: dict[str, float] = {}
+    correct_t: dict[str, float] = {}
+    total_t: dict[str, float] = {}
+    topkt: dict[str, float] = {}
+    batches = 0
+    running_val_total = 0.0
+    running_test_total = 0.0
+    iterator: Iterable[Any] = loader
+    total_batches = len(loader)
+    use_tqdm = bool(show_progress and progress_desc and tqdm is not None and total_batches > 0)
+    if use_tqdm:
+        iterator = tqdm(
+            loader,
+            total=total_batches,
+            desc=progress_desc,
+            leave=False,
+            unit="batch",
+            mininterval=0.3,
+            ncols=120,
+        )
+    t0 = time.perf_counter()
+    label = progress_desc or "eval_val_test"
+    for batch in iterator:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        with torch.no_grad():
+            outputs = model(batch)
+            m_val = batch["split_role"] == SPLIT_VAL
+            m_test = batch["split_role"] == SPLIT_TEST
+            _, met_v = compute_losses(
+                outputs,
+                batch,
+                weights,
+                m_val,
+                head_to_target=htm,
+                label_smoothing=label_smoothing,
+            )
+            _, met_t = compute_losses(
+                outputs,
+                batch,
+                weights,
+                m_test,
+                head_to_target=htm,
+                label_smoothing=label_smoothing,
+            )
+        for k, v in met_v.items():
+            totals_v[k] = totals_v.get(k, 0.0) + float(v)
+        for k, v in met_t.items():
+            totals_t[k] = totals_t.get(k, 0.0) + float(v)
+        _accumulate_accuracy_micro(outputs, batch, m_val, top_k, correct_v, total_v, topkv, htm)
+        _accumulate_accuracy_micro(outputs, batch, m_test, top_k, correct_t, total_t, topkt, htm)
+        batches += 1
+        running_val_total += float(met_v.get("total", 0.0))
+        running_test_total += float(met_t.get("total", 0.0))
+        if log_batch_interval > 0 and batches % log_batch_interval == 0:
+            log.info(
+                "%s | batches %s/%s | running_mean_val_total=%.6f | running_mean_test_total=%.6f",
+                label,
+                batches,
+                total_batches,
+                running_val_total / batches,
+                running_test_total / batches,
+            )
+        if use_tqdm and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix(
+                val_tot=f"{float(met_v.get('total', 0.0)):.4f}",
+                test_tot=f"{float(met_t.get('total', 0.0)):.4f}",
+            )
+    elapsed = time.perf_counter() - t0
+    if batches == 0:
+        log.warning("%s: no batches (empty loader)", label)
+        return {}, {}
+    out_v = _finalize_split_metrics(totals_v, batches, correct_v, total_v, topkv)
+    out_t = _finalize_split_metrics(totals_t, batches, correct_t, total_t, topkt)
+    log.info(
+        "%s | batches=%d | wall_time=%.1fs | val_mean_total=%.6f | test_mean_total=%.6f (single pass)",
+        label,
+        batches,
+        elapsed,
+        out_v.get("total", float("nan")),
+        out_t.get("total", float("nan")),
+    )
+    return out_v, out_t
 
 
 def reset_incremental_metric_files(output_dir: Path) -> None:
@@ -1035,6 +1239,85 @@ def save_artifacts(output_dir: Path, prepared: PreparedData, model: nn.Module, h
     (output_dir / "patient_event_model_artifacts.json").write_text(json.dumps(artifact, indent=2), encoding="utf-8")
 
 
+def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def save_training_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch_completed: int,
+    history: list[dict[str, Any]],
+    args: argparse.Namespace | None = None,
+) -> None:
+    """Training-state checkpoint (not written until an epoch finishes all its run_epoch phases)."""
+    payload: dict[str, Any] = {
+        "format_version": 1,
+        "epoch": epoch_completed,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "history": history,
+        "torch_rng_state": torch.get_rng_state(),
+        "numpy_rng_state": np.random.get_state(),
+        "python_rng_state": random.getstate(),
+    }
+    if args is not None:
+        payload["args"] = vars(args)
+    _atomic_torch_save(payload, path)
+
+
+def load_training_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> tuple[int, list[dict[str, Any]]]:
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    epoch_done = int(ckpt.get("epoch", 0))
+    history = list(ckpt.get("history", []))
+    rs = ckpt.get("torch_rng_state")
+    if rs is not None:
+        torch.set_rng_state(rs)
+    nprs = ckpt.get("numpy_rng_state")
+    if nprs is not None:
+        np.random.set_state(nprs)
+    pyrs = ckpt.get("python_rng_state")
+    if pyrs is not None:
+        random.setstate(pyrs)
+    return epoch_done, history
+
+
+def _build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+) -> Any:
+    """Per-epoch LR updates (call ``scheduler.step()`` once after each epoch)."""
+    if args.lr_scheduler == "none":
+        return None
+    eta_min = max(0.0, float(args.lr) * float(args.lr_min_ratio))
+    epochs = max(1, int(args.epochs))
+    wu_raw = max(0, int(args.warmup_epochs))
+    wu = min(wu_raw, max(0, epochs - 1))
+
+    if args.lr_scheduler == "cosine_warmup":
+        if wu > 0 and epochs > wu:
+            warm = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=wu)
+            cos_t = max(1, epochs - wu)
+            cool = CosineAnnealingLR(optimizer, T_max=cos_t, eta_min=eta_min)
+            return SequentialLR(optimizer, schedulers=[warm, cool], milestones=[wu])
+        if wu > 0:
+            return LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=max(1, epochs))
+        return CosineAnnealingLR(optimizer, T_max=epochs, eta_min=eta_min)
+
+    return CosineAnnealingLR(optimizer, T_max=epochs, eta_min=eta_min)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train a multi-task autoregressive patient event sequence model.")
     p.add_argument("--input", type=Path, default=Path("token_sequence_model/patient_sequences_with_external_features.pt"))
@@ -1070,6 +1353,42 @@ def parse_args() -> argparse.Namespace:
         help="Fast pipeline check: caps sequences (128), epochs (3), batch size (16); writes to patient_event_model_smoke unless --output-dir set.",
     )
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.01,
+        help="AdamW weight decay (L2); use 0 to disable.",
+    )
+    p.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=0.05,
+        help="Cross-entropy label smoothing (0 = standard CE). Can improve calibration; may also flatten loss curves.",
+    )
+    p.add_argument(
+        "--lr-scheduler",
+        choices=["none", "cosine", "cosine_warmup"],
+        default="cosine_warmup",
+        help="Learning-rate schedule: cosine decay per epoch, optionally after linear warmup.",
+    )
+    p.add_argument(
+        "--warmup-epochs",
+        type=int,
+        default=2,
+        help="Linear LR warmup length when --lr-scheduler cosine_warmup (clamped vs total epochs).",
+    )
+    p.add_argument(
+        "--lr-min-ratio",
+        type=float,
+        default=0.01,
+        help="Cosine floor as a fraction of --lr (final LR ~= lr * this ratio).",
+    )
+    p.add_argument(
+        "--grad-clip",
+        type=float,
+        default=1.0,
+        help="Max gradient norm for clipping (0 disables clipping).",
+    )
     p.add_argument(
         "--split-strategy",
         choices=["temporal", "patient_holdout"],
@@ -1123,9 +1442,34 @@ def parse_args() -> argparse.Namespace:
         help="Within each train/valid/test pass: log running mean total loss every N batches (0 disables).",
     )
     p.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="Append human-readable log lines (same as console) to this file. Parent dirs are created. "
+        "Does not capture tqdm bars; use shell redirection for full terminal capture.",
+    )
+    p.add_argument(
         "--no-incremental-metrics",
         action="store_true",
         help="Do not write training_metrics.jsonl or training_history_snapshot.json after each epoch.",
+    )
+    p.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=1,
+        help="Save checkpoint_last.pt only after a **full epoch**: temporal = train+valid+test passes; "
+        "patient_holdout = train+valid (no test split). Same path overwritten each time. 0 = no .pt checkpoints.",
+    )
+    p.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="Resume from checkpoint_last.pt (or any save_training_checkpoint file). Same --input/vocab/architecture.",
+    )
+    p.add_argument(
+        "--no-save-best",
+        action="store_true",
+        help="Do not write checkpoint_best.pt when validation total loss improves.",
     )
     ns = p.parse_args()
     _default_out = Path("data/processed/patient_event_model")
@@ -1141,12 +1485,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
-    )
+    level = getattr(logging, args.log_level.upper(), logging.INFO)
+    fmt = "%(asctime)s | %(levelname)s | %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if args.log_file is not None:
+        args.log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
+    logging.basicConfig(level=level, format=fmt, datefmt=datefmt, handlers=handlers, force=True)
+    if args.log_file is not None:
+        log.info("Also writing log lines to %s", args.log_file.resolve())
     if tqdm is None:
         log.warning("tqdm is not installed; batch-level progress bars disabled. pip install tqdm")
 
@@ -1283,7 +1631,8 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(
-        "Run configuration | input=%s vocab=%s device=%s sequences=%s split=%s epochs=%s batch_size=%s lr=%s backbone=%s d_model=%s",
+        "Run configuration | input=%s vocab=%s device=%s sequences=%s split=%s epochs=%s batch_size=%s "
+        "lr=%s scheduler=%s weight_decay=%s label_smoothing=%s backbone=%s d_model=%s",
         args.input,
         args.vocab_json,
         device,
@@ -1292,6 +1641,9 @@ def main() -> None:
         args.epochs,
         args.batch_size,
         args.lr,
+        args.lr_scheduler,
+        args.weight_decay,
+        args.label_smoothing,
         args.backbone,
         args.d_model,
     )
@@ -1339,7 +1691,20 @@ def main() -> None:
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info("Model parameters: total=%s trainable=%s heads=%s", f"{n_params:,}", f"{n_trainable:,}", len(head_to_target))
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=max(0.0, float(args.weight_decay)),
+    )
+    scheduler = _build_lr_scheduler(optimizer, args)
+    if scheduler is not None:
+        log.info(
+            "LR schedule: %s | warmup_epochs=%s lr_min≈%.2e (ratio=%s)",
+            args.lr_scheduler,
+            args.warmup_epochs,
+            float(args.lr) * float(args.lr_min_ratio),
+            args.lr_min_ratio,
+        )
     weights = {
         "type": args.w_type,
         "event_description": args.w_event_description,
@@ -1374,107 +1739,172 @@ def main() -> None:
             args.output_dir / "training_history_snapshot.json",
         )
 
-    for epoch in range(1, args.epochs + 1):
-        log.info("---------- Epoch %s / %s ----------", epoch, args.epochs)
-        if use_temporal:
-            train_metrics = run_epoch(
-                model,
-                train_loader,
-                optimizer,
-                device,
-                weights,
-                head_to_target=head_to_target,
-                temporal=True,
-                split_role_filter=SPLIT_TRAIN,
-                progress_desc=f"[{epoch}/{args.epochs}] train",
-                show_progress=show_progress,
-                log_batch_interval=log_batch_iv,
-            )
-            valid_metrics = run_epoch(
-                model,
-                eval_loader,
-                None,
-                device,
-                weights,
-                head_to_target=head_to_target,
-                temporal=True,
-                split_role_filter=SPLIT_VAL,
-                compute_accuracy=True,
-                top_k=top_k,
-                progress_desc=f"[{epoch}/{args.epochs}] valid",
-                show_progress=show_progress,
-                log_batch_interval=log_batch_iv,
-            )
-            test_metrics = run_epoch(
-                model,
-                eval_loader,
-                None,
-                device,
-                weights,
-                head_to_target=head_to_target,
-                temporal=True,
-                split_role_filter=SPLIT_TEST,
-                compute_accuracy=True,
-                top_k=top_k,
-                progress_desc=f"[{epoch}/{args.epochs}] test",
-                show_progress=show_progress,
-                log_batch_interval=log_batch_iv,
-            )
-            record = {"epoch": epoch, "train": train_metrics, "valid": valid_metrics, "test": test_metrics}
-            log.info(
-                "Epoch %s/%s done | train_loss=%.6f valid_loss=%.6f test_loss=%.6f",
-                epoch,
-                args.epochs,
-                train_metrics.get("total", float("nan")),
-                valid_metrics.get("total", float("nan")),
-                test_metrics.get("total", float("nan")),
-            )
-        else:
-            train_metrics = run_epoch(
-                model,
-                train_loader,
-                optimizer,
-                device,
-                weights,
-                head_to_target=head_to_target,
-                temporal=False,
-                progress_desc=f"[{epoch}/{args.epochs}] train",
-                show_progress=show_progress,
-                log_batch_interval=log_batch_iv,
-            )
-            valid_metrics = (
-                run_epoch(
+    ckpt_last = args.output_dir / "checkpoint_last.pt"
+    ckpt_best = args.output_dir / "checkpoint_best.pt"
+    best_valid_loss = float("inf")
+    start_epoch = 0
+    if args.resume is not None:
+        if not args.resume.exists():
+            raise SystemExit(f"Resume checkpoint not found: {args.resume}")
+        start_epoch, history = load_training_checkpoint(args.resume, model, optimizer, device)
+        log.info(
+            "Resumed from %s | last completed epoch=%s | history_len=%s",
+            args.resume.resolve(),
+            start_epoch,
+            len(history),
+        )
+        for rec in history:
+            vm = rec.get("valid")
+            if isinstance(vm, dict):
+                t = vm.get("total")
+                if isinstance(t, (int, float)) and math.isfinite(float(t)):
+                    best_valid_loss = min(best_valid_loss, float(t))
+
+    if start_epoch >= args.epochs:
+        log.warning(
+            "Checkpoint epoch (%s) already >= --epochs (%s); writing final artifacts only.",
+            start_epoch,
+            args.epochs,
+        )
+        save_artifacts(args.output_dir, prepared, model, history, args)
+        log.info("Saved artifacts to %s", args.output_dir.resolve())
+        print(json.dumps({"status": "done", "output_dir": str(args.output_dir), "metadata": prepared.metadata}, indent=2), flush=True)
+        return
+
+    last_completed_epoch = start_epoch
+
+    try:
+        for epoch in range(start_epoch + 1, args.epochs + 1):
+            log.info("---------- Epoch %s / %s ----------", epoch, args.epochs)
+            if use_temporal:
+                train_metrics = run_epoch(
                     model,
-                    valid_loader,
-                    None,
+                    train_loader,
+                    optimizer,
+                    device,
+                    weights,
+                    head_to_target=head_to_target,
+                    temporal=True,
+                    split_role_filter=SPLIT_TRAIN,
+                    progress_desc=f"[{epoch}/{args.epochs}] train",
+                    show_progress=show_progress,
+                    log_batch_interval=log_batch_iv,
+                    label_smoothing=args.label_smoothing,
+                    grad_clip=args.grad_clip,
+                )
+                valid_metrics, test_metrics = run_eval_temporal_val_test_combined(
+                    model,
+                    eval_loader,
+                    device,
+                    weights,
+                    head_to_target=head_to_target,
+                    top_k=top_k,
+                    progress_desc=f"[{epoch}/{args.epochs}] valid+test",
+                    show_progress=show_progress,
+                    log_batch_interval=log_batch_iv,
+                    label_smoothing=args.label_smoothing,
+                )
+                record = {"epoch": epoch, "train": train_metrics, "valid": valid_metrics, "test": test_metrics}
+                log.info(
+                    "Epoch %s/%s done | train_loss=%.6f valid_loss=%.6f test_loss=%.6f",
+                    epoch,
+                    args.epochs,
+                    train_metrics.get("total", float("nan")),
+                    valid_metrics.get("total", float("nan")),
+                    test_metrics.get("total", float("nan")),
+                )
+                head_order = list(weights.keys())
+                log_per_head_mean_ce(f"Epoch {epoch}/{args.epochs} train", train_metrics, head_order)
+                log_per_head_mean_ce(f"Epoch {epoch}/{args.epochs} valid", valid_metrics, head_order)
+                log_per_head_mean_ce(f"Epoch {epoch}/{args.epochs} test", test_metrics, head_order)
+            else:
+                train_metrics = run_epoch(
+                    model,
+                    train_loader,
+                    optimizer,
                     device,
                     weights,
                     head_to_target=head_to_target,
                     temporal=False,
-                    progress_desc=f"[{epoch}/{args.epochs}] valid",
+                    progress_desc=f"[{epoch}/{args.epochs}] train",
                     show_progress=show_progress,
                     log_batch_interval=log_batch_iv,
+                    label_smoothing=args.label_smoothing,
+                    grad_clip=args.grad_clip,
                 )
-                if valid_loader is not None
-                else None
-            )
-            record = {"epoch": epoch, "train": train_metrics, "valid": valid_metrics, "test": None}
-            vl = valid_metrics.get("total") if valid_metrics else None
-            log.info(
-                "Epoch %s/%s done | train_loss=%.6f valid_loss=%s",
-                epoch,
-                args.epochs,
-                train_metrics.get("total", float("nan")),
-                f"{vl:.6f}" if vl is not None else "n/a",
-            )
+                valid_metrics = (
+                    run_epoch(
+                        model,
+                        valid_loader,
+                        None,
+                        device,
+                        weights,
+                        head_to_target=head_to_target,
+                        temporal=False,
+                        progress_desc=f"[{epoch}/{args.epochs}] valid",
+                        show_progress=show_progress,
+                        log_batch_interval=log_batch_iv,
+                        label_smoothing=args.label_smoothing,
+                        grad_clip=args.grad_clip,
+                    )
+                    if valid_loader is not None
+                    else None
+                )
+                record = {"epoch": epoch, "train": train_metrics, "valid": valid_metrics, "test": None}
+                vl = valid_metrics.get("total") if valid_metrics else None
+                log.info(
+                    "Epoch %s/%s done | train_loss=%.6f valid_loss=%s",
+                    epoch,
+                    args.epochs,
+                    train_metrics.get("total", float("nan")),
+                    f"{vl:.6f}" if vl is not None else "n/a",
+                )
+                head_order = list(weights.keys())
+                log_per_head_mean_ce(f"Epoch {epoch}/{args.epochs} train", train_metrics, head_order)
+                if valid_metrics:
+                    log_per_head_mean_ce(f"Epoch {epoch}/{args.epochs} valid", valid_metrics, head_order)
 
-        history.append(record)
-        print(json.dumps(record), flush=True)
+            if scheduler is not None:
+                scheduler.step()
+            log.info("Optimizer LR after epoch %s (next epoch): %.2e", epoch, optimizer.param_groups[0]["lr"])
 
-        if not args.no_incremental_metrics:
-            append_epoch_metrics_jsonl(args.output_dir, record)
-            save_training_history_snapshot(args.output_dir, history)
-            log.info("Wrote incremental metrics (%s epochs in snapshot)", len(history))
+            history.append(record)
+            print(json.dumps(record), flush=True)
+
+            if not args.no_incremental_metrics:
+                append_epoch_metrics_jsonl(args.output_dir, record)
+                save_training_history_snapshot(args.output_dir, history)
+                log.info("Wrote incremental metrics (%s epochs in snapshot)", len(history))
+
+            # .pt checkpoints only after full epoch (train → val → test for temporal; train → val for holdout).
+            if args.checkpoint_every > 0 and epoch % args.checkpoint_every == 0:
+                save_training_checkpoint(ckpt_last, model, optimizer, epoch, history, args)
+                log.info("Checkpoint saved after full epoch %s: %s", epoch, ckpt_last.resolve())
+
+            if not args.no_save_best:
+                vm = record.get("valid")
+                vl_best = vm.get("total") if isinstance(vm, dict) else None
+                if (
+                    vl_best is not None
+                    and isinstance(vl_best, (int, float))
+                    and math.isfinite(float(vl_best))
+                    and float(vl_best) < best_valid_loss
+                ):
+                    best_valid_loss = float(vl_best)
+                    save_training_checkpoint(ckpt_best, model, optimizer, epoch, history, args)
+                    log.info("New best valid total loss=%.6f -> %s", best_valid_loss, ckpt_best.resolve())
+
+            last_completed_epoch = epoch
+
+    except KeyboardInterrupt:
+        log.warning(
+            "KeyboardInterrupt after last fully completed epoch %s — saving %s",
+            last_completed_epoch,
+            ckpt_last,
+        )
+        if args.checkpoint_every != 0 and last_completed_epoch > start_epoch:
+            save_training_checkpoint(ckpt_last, model, optimizer, last_completed_epoch, history, args)
+        raise SystemExit(130) from None
 
     save_artifacts(args.output_dir, prepared, model, history, args)
     log.info("Saved artifacts to %s", args.output_dir.resolve())

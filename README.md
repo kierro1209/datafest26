@@ -48,18 +48,23 @@ python modelling/train_patient_event_model.py \
 | Flag | Notes |
 |------|--------|
 | `--epochs`, `--batch-size`, `--lr` | Training loop |
+| `--lr-scheduler`, `--warmup-epochs`, `--lr-min-ratio` | Default **`cosine_warmup`** (cosine decay after linear warmup); **`cosine`** or **`none`** |
+| `--weight-decay`, `--label-smoothing`, `--grad-clip` | AdamW decay (default `0.01`), CE label smoothing (default `0.05`), grad clip (default `1.0`; `0` = off) |
 | `--max-seq-len` | Truncate sequences (also affects temporal split boundaries) |
 | `--backbone` | `transformer` (default), `gru`, `lstm` |
 | `--d-model`, `--n-layers`, `--n-heads`, `--dropout` | Model size |
 | `--w-type`, `--w-gap`, … | Per-head CE weights |
 | `--w-external` | Weight for each auto-discovered extra `<base>_ids` stream |
+| `--checkpoint-every N` | Write `checkpoint_last.pt` only after a **full epoch** (temporal: train+val+**test**; holdout: train+val). `0` = off |
+| `--resume`, `--no-save-best` | Resume training; skip writing `checkpoint_best.pt` on improved val loss |
 
 ### Outputs (`--output-dir`)
 
-- `patient_event_model.pt` — checkpoint and args  
+- `patient_event_model.pt` — final weights and args (after all epochs)  
 - `patient_event_model_artifacts.json` — vocab copies, metadata, full **`training_history`** (written once training completes)
+- `checkpoint_last.pt` / `checkpoint_best.pt` — optional mid-run saves (see `--checkpoint-every`); each save is after val **and** test when using temporal split
 
-**During training** (unless `--no-incremental-metrics`): **`training_metrics.jsonl`** appends one JSON object per epoch (same shape as stdout lines), and **`training_history_snapshot.json`** is overwritten each epoch with all epochs so far — useful if a run is interrupted. **`--log-batch-interval N`** (default `50`) logs running mean total loss every `N` batches within train/valid/test passes; set **`0`** to disable that intra-phase spam.
+**During training** (unless `--no-incremental-metrics`): **`training_metrics.jsonl`** appends one JSON object per epoch (same shape as stdout lines), and **`training_history_snapshot.json`** is overwritten each epoch with all epochs so far — useful if a run is interrupted. Use **`--log-file PATH`** to duplicate **`logging`** lines to a file (tqdm progress still needs shell redirection if you want it in the same file). **`--log-batch-interval N`** (default `50`) logs running mean total loss every `N` batches within train/valid/test passes; set **`0`** to disable that intra-phase spam.
 
 Epoch stdout logs include `train`, `valid`, and under temporal split also `test`.
 
@@ -76,4 +81,4 @@ python modelling/infer_patient_event_model.py \
 
 `--input` / `--vocab-json` default to the paths stored in the checkpoint. Use **`--split`** with **`temporal`** training: `val`, `test`, `both`, or `train`. With **`patient_holdout`**, exports validation patients only (`all_holdout_valid`). Add **`--decode-labels`** for string labels via inverse vocab maps. **`--max-rows`** caps rows for quick checks.
 
-See [`tokenization.md`](tokenization.md) for upstream sequence generation when applicable.
+See [`tokenization.md`](tokenization.md) for upstream sequence generation when applicable. For model architecture, splits, loss, and training behavior, see [`docs/patient_event_model.md`](docs/patient_event_model.md).
