@@ -313,13 +313,19 @@ def plot_04_heatmap(stress: pd.DataFrame, out: Path, *, max_specialties: int = 3
     stress["month"] = pd.to_datetime(stress["month"])
     vol = stress.groupby("DepartmentSpecialty_disp")["encounters"].sum()
     top_specs = vol.nlargest(max_specialties).index
-    sub = stress[stress["DepartmentSpecialty_disp"].isin(top_specs)]
+    sub = stress[
+        stress["DepartmentSpecialty_disp"].isin(top_specs)
+        & ~stress["DepartmentSpecialty_disp"].astype(str).str.lower().str.contains("unspecified")
+    ]
+
     pivot = sub.pivot_table(
         index="DepartmentSpecialty_disp",
         columns="month",
         values="stress_score",
         aggfunc="mean",
-    ).reindex(vol.loc[top_specs].index)
+    )
+
+    pivot = pivot[~pivot.index.str.lower().str.contains("unspecified")]
 
     w = max(11, min(28, 0.18 * pivot.shape[1] + 7))
     h = max(7, min(22, 0.22 * pivot.shape[0] + 4))
