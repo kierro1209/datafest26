@@ -7,7 +7,7 @@ Reads:
   - ``training_history_snapshot.json`` from train_patient_event_model (per-epoch valid/test metrics)
 
 Outputs:
-  - Dumbbell chart: baseline vs final-epoch **test** accuracy, sorted by improvement (model − baseline).
+  - Dumbbell chart: baseline vs final-epoch **test Top-1** accuracy, sorted by improvement (model − baseline).
   - Optional appendix: small multiples of **test** accuracy vs epoch with dashed conditional-frequency baselines.
 
 Example:
@@ -138,19 +138,13 @@ def plot_dumbbell(
     if cmp_df.empty:
         raise SystemExit("No overlapping baseline/model tasks to plot.")
 
-    if sort_by == "top1":
-        cmp_df = cmp_df.sort_values("delta_top1", ascending=True)
-    elif sort_by == "top5":
-        cmp_df = cmp_df.sort_values("delta_top5", ascending=True)
-    else:
-        cmp_df = cmp_df.assign(
-            _mean_d=(cmp_df["delta_top1"] + cmp_df["delta_top5"]) / 2.0
-        ).sort_values("_mean_d", ascending=True)
-        cmp_df = cmp_df.drop(columns=["_mean_d"])
+    if sort_by != "top1":
+        raise SystemExit("plot_dumbbell now supports only sort_by='top1'.")
+    cmp_df = cmp_df.sort_values("delta_top1", ascending=True)
 
     tasks = cmp_df["task"].tolist()
     y = np.arange(len(tasks))
-    fig, (ax1, ax5) = plt.subplots(1, 2, figsize=(11.5, max(4.0, 0.38 * len(tasks) + 1.2)), sharey=True)
+    fig, ax1 = plt.subplots(1, 1, figsize=(7.2, max(4.0, 0.38 * len(tasks) + 1.2)))
 
     def _panel(ax: Any, bcol: str, mcol: str, dcol: str, ptitle: str) -> None:
         for i, r in enumerate(cmp_df.itertuples(index=False)):
@@ -169,10 +163,9 @@ def plot_dumbbell(
         ax.grid(True, axis="x", alpha=0.35)
 
     _panel(ax1, "baseline_top1", "model_top1", "delta_top1", "Top-1 accuracy")
-    _panel(ax5, "baseline_top5", "model_top5", "delta_top5", "Top-5 accuracy")
     ax1.invert_yaxis()
 
-    # Legend below panels (avoids covering low-y tasks like gap).
+    # Legend below panel (avoids covering low-y tasks like gap).
     h0, l0 = ax1.get_legend_handles_labels()
     if h0:
         fig.legend(
@@ -190,7 +183,7 @@ def plot_dumbbell(
         if leg_ax is not None:
             leg_ax.remove()
 
-    # Low rect top (~0.74) clears space above axes so subtitle does not overlap panel titles.
+    # Low rect top (~0.74) clears space above axes so subtitle does not overlap panel title.
     plt.tight_layout(rect=[0, 0.09, 1, 0.74])
     fig.suptitle(title, fontsize=12, fontweight="600", y=0.975)
     fig.text(0.5, 0.888, subtitle, ha="center", fontsize=9, color="#475569")
@@ -269,7 +262,7 @@ def plot_learning_curves_appendix(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Dumbbell + appendix plots: model vs empirical baseline.")
+    ap = argparse.ArgumentParser(description="Top-1 dumbbell + appendix plots: model vs empirical baseline.")
     ap.add_argument(
         "--baseline",
         type=Path,
@@ -296,9 +289,9 @@ def main() -> None:
     )
     ap.add_argument(
         "--sort-by",
-        choices=("top1", "top5", "mean"),
+        choices=("top1",),
         default="top1",
-        help="Sort tasks by delta: top1, top5, or mean of the two.",
+        help="Sort tasks by Top-1 accuracy delta.",
     )
     ap.add_argument(
         "--learning-curves",
@@ -341,7 +334,7 @@ def main() -> None:
     if args.heads_subset != "all":
         stem += f"_{args.heads_subset}"
 
-    title = "Model vs empirical baseline by prediction task (test set, final epoch)"
+    title = "Model vs empirical baseline by prediction task (test set, final epoch, Top-1)"
     subtitle = (
         "Baseline = conditional frequency of next label given current label (linked pairs). "
         f"Final epoch = {int(final.get('epoch', 0))}. "
