@@ -8,7 +8,7 @@ Extracts:
   - Optimizer LR after epoch ...
   - Batch-interval running means (train / valid+test) plus final batch= lines.
   - Plots batch metrics across the full run (global batch index).
-  - From training_history_snapshot.json: per-head top-1 (acc_*) and top-5 (top5_*) curves.
+  - From training_history_snapshot.json: 2x2 Val/Test x top-1 / top-5 accuracy ({stem}_accuracy_level.png).
 """
 
 from __future__ import annotations
@@ -21,14 +21,16 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
+from matplotlib.axes import Axes
 import numpy as np
 
 # Repo root = parent of modelling/; default PNG dir is visuals/gpt_model/
 _DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent.parent / "visuals" / "gpt_model"
 
+# test_loss may follow as " test_loss=..." (space) or " | test_loss=..." (pipe)
 RE_EPOCH_DONE = re.compile(
     r"Epoch (\d+)/(\d+) done \| train_loss=([\d.eE+-]+) valid_loss=([\w.eE+-/]+)"
-    r"(?:\s+\| test_loss=([\d.eE+-]+))?"
+    r"(?:\s*(?:\|\s*)?test_loss=([\d.eE+-]+))?"
 )
 RE_PER_HEAD = re.compile(
     r"Epoch (\d+)/(\d+) (train|valid|test) \| per-head mean CE: (.+?) \| total=([\d.eE+-]+)"
@@ -183,51 +185,48 @@ def plot_totals_and_lr(
         raise SystemExit("No 'Epoch ... done' lines found in log.")
 
     eps = [r["epoch"] for r in rows]
-    train = [r["train_loss"] for r in rows]
-    valid = [r["valid_loss"] for r in rows]
-    test = [r["test_loss"] for r in rows]
-    has_test = any(t is not None for t in test)
-    has_valid = any(v is not None for v in valid)
+    train = np.array([r["train_loss"] for r in rows], dtype=float)
+    valid = np.array(
+        [r["valid_loss"] if r["valid_loss"] is not None else np.nan for r in rows],
+        dtype=float,
+    )
+    test = np.array(
+        [r["test_loss"] if r["test_loss"] is not None else np.nan for r in rows],
+        dtype=float,
+    )
+    has_valid = bool(np.any(np.isfinite(valid)))
+    has_test = bool(np.any(np.isfinite(test)))
 
-    lr = parsed["lr_after_epoch"]
-    show_lr = bool(lr)
+    fig, ax0 = plt.subplots(1, 1, figsize=(9, 5))
 
-    fig, axes = plt.subplots(2 if show_lr else 1, 1, figsize=(9, 5 if not show_lr else 7.5))
-    if not show_lr:
-        ax0 = axes
-    else:
-        ax0, ax1 = axes
-
-    ax0.plot(eps, train, "o-", label="train", color="C0")
+    ax0.plot(eps, train, "o-", label="Train slice", color="C0")
     if has_valid:
-        ax0.plot(eps, valid, "s-", label="valid", color="C1")
+        ax0.plot(eps, valid, "s-", label="Validation future slice", color="C1")
     if has_test:
-        ax0.plot(eps, test, "^-", label="test", color="C2")
-    ax0.set_xlabel("epoch")
-    ax0.set_ylabel("total loss")
+        ax0.plot(eps, test, "^-", label="Test future slice", color="C2")
+    ax0.set_xlabel("Epoch")
+    ax0.set_ylabel("Mean total cross-entropy loss")
     ax0.set_xticks(eps)
     ax0.grid(True, alpha=0.3)
     ax0.legend(loc="best")
-    ax0.set_title(title or "Epoch totals (from train.log)")
-
-    if show_lr:
-        lr_eps = sorted(lr.keys())
-        ax1.plot(lr_eps, [lr[e] for e in lr_eps], "D-", color="C3")
-        ax1.set_xlabel("epoch (after which LR applies to next epoch)")
-        ax1.set_ylabel("learning rate")
-        ax1.set_yscale("log")
-        ax1.grid(True, alpha=0.3)
+    ax0.set_title(
+        title or "Sequence model improves next-encounter forecasting"
+    )
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
 
+def _split_panel_title(split: str) -> str:
+    return {"train": "Train", "valid": "Val", "test": "Test"}.get(split, split)
+
+
 def plot_per_head_lines(
     per_head: dict[str, dict[str, dict[int, float]]],
     splits: list[str],
     out_path: Path,
-    title_prefix: str,
+    _title_prefix: str,
 ) -> None:
     all_heads: set[str] = set()
     for sp in splits:
@@ -261,8 +260,8 @@ def plot_per_head_lines(
                 continue
             ys = [sub[h].get(e, np.nan) for e in eps]
             ax.plot(eps, ys, "o-", label=h, color=colors[h], linewidth=1.2, markersize=3)
-        ax.set_ylabel("mean CE")
-        ax.set_title(f"{title_prefix} — {split}")
+        ax.set_ylabel("Mean cross-entropy")
+        ax.set_title(_split_panel_title(split))
         ax.grid(True, alpha=0.3)
         ax.set_xticks(eps)
 
@@ -279,7 +278,7 @@ def plot_per_head_lines(
 def plot_full_run_batch_series(
     parsed: dict[str, Any],
     out_path: Path,
-    stem: str,
+    _stem: str,
 ) -> None:
     """Train and eval running means vs global batch index (each phase uses its own batch counter)."""
     train_by_ep = parsed["train_batch_curves"]
@@ -325,9 +324,9 @@ def plot_full_run_batch_series(
 
     if gx:
         ax.plot(gx, gy, "-", color="C0", lw=0.85, alpha=0.88, label="running mean (log intervals)")
-    ax.set_ylabel("total loss")
-    ax.set_xlabel("global train batch index (epochs concatenated)")
-    ax.set_title(f"{stem} — train running mean total loss (per-batch logs)")
+    ax.set_ylabel("Mean total loss")
+    ax.set_xlabel("Global train batch index")
+    ax.set_title("Train")
     ax.grid(True, alpha=0.3)
     handles, labels = ax.get_legend_handles_labels()
     ax.legend(
@@ -366,7 +365,7 @@ def plot_full_run_batch_series(
                     marker="s",
                     edgecolors="white",
                     linewidths=0.6,
-                    label="epoch summary valid_loss" if i == 0 else "",
+                    label="epoch summary val loss" if i == 0 else "",
                 )
             if row.get("test_loss") is not None:
                 ax2.scatter(
@@ -385,11 +384,11 @@ def plot_full_run_batch_series(
             ax2.axvline(offset_e, color="0.55", ls="--", lw=0.85, alpha=0.85)
 
     if gx2:
-        ax2.plot(gx2, gv, "-", color="C1", lw=0.85, label="valid running mean")
+        ax2.plot(gx2, gv, "-", color="C1", lw=0.85, label="val running mean")
         ax2.plot(gx2, gt, "-", color="C2", lw=0.85, label="test running mean")
-    ax2.set_ylabel("total loss")
-    ax2.set_xlabel("global eval batch index (valid+test pass, epochs concatenated)")
-    ax2.set_title(f"{stem} — eval running means (single forward per batch)")
+    ax2.set_ylabel("Mean total loss")
+    ax2.set_xlabel("Global eval batch index")
+    ax2.set_title("Eval")
     ax2.grid(True, alpha=0.3)
     h2, l2 = ax2.get_legend_handles_labels()
     ax2.legend(
@@ -401,7 +400,7 @@ def plot_full_run_batch_series(
     )
 
     fig.suptitle(
-        "Batch-level metrics from train.log (vertical lines separate epochs)",
+        "Mean total loss vs batch index (train / eval)",
         fontsize=11,
         y=1.02,
     )
@@ -436,42 +435,106 @@ def _snapshot_metric_series(
     return out
 
 
-def plot_snapshot_prefix_metrics(
+def _plot_snapshot_metrics_on_ax(
+    ax: Axes,
+    eps: list[int],
+    bundle: dict[str, list[float | None]],
+    *,
+    title: str,
+    y_axis_label: str,
+    legend_strip: str,
+) -> bool:
+    if not bundle:
+        ax.set_visible(False)
+        return False
+    for i, (name, ys) in enumerate(bundle.items()):
+        lab = name[len(legend_strip) :] if name.startswith(legend_strip) else name
+        ax.plot(eps, ys, "o-", label=lab, color=f"C{i % 10}")
+    ax.set_title(title)
+    ax.set_xlabel("epoch")
+    ax.set_ylabel(y_axis_label)
+    ax.set_xticks(eps)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=7)
+    return True
+
+
+def plot_snapshot_top1_top5_2x2(
     snapshot: list[dict[str, Any]],
     out_path: Path,
-    *,
-    key_prefix: str,
-    legend_strip: str,
-    panel_title_metric: str,
-    y_axis_label: str,
 ) -> bool:
-    """Plot valid/test panels for snapshot keys starting with key_prefix. Returns True if a file was written."""
+    """2x2 grid: Val/Test x top-1 / top-5 accuracy from snapshot. Returns True if a file was written."""
     eps = [row["epoch"] for row in snapshot if isinstance(row.get("epoch"), int)]
     if not eps:
         return False
 
-    m_v = _snapshot_metric_series(snapshot, key_prefix, "valid")
-    m_t = _snapshot_metric_series(snapshot, key_prefix, "test")
-    if not m_v and not m_t:
+    m_v_acc = _snapshot_metric_series(snapshot, "acc_", "valid")
+    m_t_acc = _snapshot_metric_series(snapshot, "acc_", "test")
+    m_v_top = _snapshot_metric_series(snapshot, "top5_", "valid")
+    m_t_top = _snapshot_metric_series(snapshot, "top5_", "test")
+    if not (m_v_acc or m_t_acc or m_v_top or m_t_top):
         return False
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
-    for ax, split, bundle in (
-        (axes[0], "valid", m_v),
-        (axes[1], "test", m_t),
-    ):
-        if not bundle:
-            ax.set_visible(False)
-            continue
-        for i, (name, ys) in enumerate(bundle.items()):
-            lab = name[len(legend_strip) :] if name.startswith(legend_strip) else name
-            ax.plot(eps, ys, "o-", label=lab, color=f"C{i % 10}")
-        ax.set_title(f"{split} {panel_title_metric} (from snapshot)")
-        ax.set_xlabel("epoch")
-        ax.set_ylabel(y_axis_label)
-        ax.set_xticks(eps)
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=7)
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9), sharex="col")
+    any_acc = _plot_snapshot_metrics_on_ax(
+        axes[0, 0],
+        eps,
+        m_v_acc,
+        title="Val — top-1 accuracy",
+        y_axis_label="accuracy",
+        legend_strip="acc_",
+    )
+    any_acc_t = _plot_snapshot_metrics_on_ax(
+        axes[0, 1],
+        eps,
+        m_t_acc,
+        title="Test — top-1 accuracy",
+        y_axis_label="accuracy",
+        legend_strip="acc_",
+    )
+    if any_acc and any_acc_t:
+        y0 = min(
+            y
+            for ax in (axes[0, 0], axes[0, 1])
+            for y in ax.get_ylim()
+        )
+        y1 = max(
+            y
+            for ax in (axes[0, 0], axes[0, 1])
+            for y in ax.get_ylim()
+        )
+        for ax in (axes[0, 0], axes[0, 1]):
+            ax.set_ylim(y0, y1)
+
+    any_t5v = _plot_snapshot_metrics_on_ax(
+        axes[1, 0],
+        eps,
+        m_v_top,
+        title="Val — top-5 accuracy",
+        y_axis_label="accuracy",
+        legend_strip="top5_",
+    )
+    any_t5t = _plot_snapshot_metrics_on_ax(
+        axes[1, 1],
+        eps,
+        m_t_top,
+        title="Test — top-5 accuracy",
+        y_axis_label="accuracy",
+        legend_strip="top5_",
+    )
+    if any_t5v and any_t5t:
+        y0 = min(
+            y
+            for ax in (axes[1, 0], axes[1, 1])
+            for y in ax.get_ylim()
+        )
+        y1 = max(
+            y
+            for ax in (axes[1, 0], axes[1, 1])
+            for y in ax.get_ylim()
+        )
+        for ax in (axes[1, 0], axes[1, 1]):
+            ax.set_ylim(y0, y1)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -499,7 +562,7 @@ def main() -> None:
         "--title",
         type=str,
         default=None,
-        help="Title for the totals plot",
+        help="Title for the totals plot (default: sequence-model headline)",
     )
     ap.add_argument(
         "--snapshot",
@@ -557,21 +620,9 @@ def main() -> None:
     if snap_path is not None:
         snap = load_snapshot_metrics(snap_path.resolve())
         if snap:
-            plot_snapshot_prefix_metrics(
+            plot_snapshot_top1_top5_2x2(
                 snap,
-                out_dir / f"{stem}_accuracy_snapshot.png",
-                key_prefix="acc_",
-                legend_strip="acc_",
-                panel_title_metric="top-1 accuracy",
-                y_axis_label="accuracy",
-            )
-            plot_snapshot_prefix_metrics(
-                snap,
-                out_dir / f"{stem}_top5_snapshot.png",
-                key_prefix="top5_",
-                legend_strip="top5_",
-                panel_title_metric="top-5 accuracy",
-                y_axis_label="accuracy",
+                out_dir / f"{stem}_accuracy_level.png",
             )
 
     print(f"Wrote plots under {out_dir}")

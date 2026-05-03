@@ -42,3 +42,9 @@ token_sequence_model/__pycache__/*
 
 # Tracked token schema (exception to *.json)
 !token_sequence_model/final_token_format.json
+
+eda/__pycache__/
+logs/
+modelling/__pycache__/diagnose_prediction_collapse.cpython-310.pyc
+modelling/__pycache__/train_patient_event_model.cpython-310.pyc
+modelling/__pycache__/visualize_train_log.cpython-310.pyc
