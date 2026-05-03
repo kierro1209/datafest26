@@ -37,8 +37,8 @@ logger = logging.getLogger(__name__)
 
 
 CAPTION = (
-    "Denominator: linked encounters only. Metrics are empirical conditional frequencies, "
-    "not model accuracy."
+    "Denominator: linked encounters only (counts n under each label — pairs with non-missing "
+    "current and next for that field). Metrics are empirical conditional frequencies, not model accuracy."
 )
 
 
@@ -77,6 +77,113 @@ def _baseline_conditional(
     return mode_map, top5_map
 
 
+def _norm_token(v: object, max_len: int = 80) -> str:
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "UNKNOWN"
+    s = str(v).strip()
+    if not s or s.lower() in ("nan", "none", ""):
+        return "UNKNOWN"
+    return s[:max_len]
+
+
+def _trueish(v: object) -> bool:
+    t = _norm_token(v, 40).upper()
+    return t in {"1", "TRUE", "T", "YES", "Y"}
+
+
+def _volume_bin(n: object) -> str:
+    try:
+        x = int(n) if n is not None and not (isinstance(n, float) and np.isnan(n)) else None
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+    if x is None:
+        return "UNKNOWN"
+    if x < 100:
+        return "VERY_LOW"
+    if x < 1000:
+        return "LOW"
+    if x < 10000:
+        return "MID"
+    if x < 100000:
+        return "HIGH"
+    return "VERY_HIGH"
+
+
+def _region_labels(eda: pd.DataFrame) -> pd.Series:
+    county_raw = pd.Series(np.nan, index=eda.index, dtype=object)
+    if "department_County" in eda.columns:
+        county_raw = eda["department_County"]
+    if "County" in eda.columns:
+        county_raw = county_raw.fillna(eda["County"])
+    county_s = county_raw.map(lambda x: _norm_token(x, 60))
+    city_s = (
+        eda["department_City"].map(lambda x: _norm_token(x, 60))
+        if "department_City" in eda.columns
+        else pd.Series("UNKNOWN", index=eda.index)
+    )
+    postal_s = (
+        eda["department_PostalCode"].map(lambda x: _norm_token(x, 20))
+        if "department_PostalCode" in eda.columns
+        else pd.Series("UNKNOWN", index=eda.index)
+    )
+    result = pd.Series("UNKNOWN", index=eda.index, dtype=object)
+    m_county = county_s != "UNKNOWN"
+    result[m_county] = "COUNTY_" + county_s[m_county].astype(str)
+    m_city = (result == "UNKNOWN") & (city_s != "UNKNOWN")
+    result[m_city] = "CITY_" + city_s[m_city].astype(str)
+    m_zip = (result == "UNKNOWN") & (postal_s != "UNKNOWN")
+    result[m_zip] = "ZIP_" + postal_s[m_zip].astype(str)
+    return result
+
+
+def _setting_labels(eda: pd.DataFrame) -> pd.Series:
+    def col(name: str) -> pd.Series:
+        return eda[name] if name in eda.columns else pd.Series(False, index=eda.index)
+
+    ed_vis = col("IsEdVisit").map(_trueish)
+    inp = col("IsInpatientAdmission").map(_trueish)
+    hadm = col("IsHospitalAdmission").map(_trueish)
+    obs = col("IsObservation").map(_trueish)
+    hop = col("IsHospitalOutpatientVisit").map(_trueish)
+    opf = col("IsOutpatientFaceToFaceVisit").map(_trueish)
+    return pd.Series(
+        np.select(
+            [ed_vis, inp, hadm, obs, hop, opf],
+            ["ED", "INPATIENT", "HOSP_ADMIT", "OBS", "HOSP_OP", "OP_FACE"],
+            default="NONE",
+        ),
+        index=eda.index,
+    )
+
+
+def _event_description_labels(eda: pd.DataFrame) -> pd.Series:
+    vt = (
+        eda["VisitTypeDescription"].fillna("(missing)").astype(str)
+        if "VisitTypeDescription" in eda.columns
+        else pd.Series("(missing)", index=eda.index)
+    )
+    if "event_description" not in eda.columns:
+        return vt
+    ed = eda["event_description"]
+    mask = ed.notna() & (ed.astype(str).str.strip() != "") & (ed.astype(str).str.lower() != "nan")
+    return pd.Series(np.where(mask, ed.astype(str), vt), index=eda.index)
+
+
+def _incoming_gap_labels(eda: pd.DataFrame) -> pd.Series:
+    g = eda.groupby("PatientDurableKey", sort=False)
+    prev_dt = g["event_datetime"].shift(1)
+    floor_days = np.floor((eda["event_datetime"] - prev_dt).dt.total_seconds() / 86400.0)
+    enc_idx = g.cumcount()
+    out: list[str] = []
+    for i in range(len(eda)):
+        if enc_idx.iloc[i] == 0 or pd.isna(prev_dt.iloc[i]):
+            out.append("START")
+        else:
+            fd = floor_days.iloc[i]
+            out.append(days_to_gap_label(int(fd)) if pd.notna(fd) else "UNKNOWN")
+    return pd.Series(out, index=eda.index, dtype=object)
+
+
 def evaluate_task(
     name: str,
     cur: pd.Series,
@@ -87,10 +194,9 @@ def evaluate_task(
     nxt = nxt[mask].astype(str)
     n = len(cur)
     if n == 0:
-        return {"task": name, "n": 0, "top1_global": np.nan, "top1_conditional": np.nan, "top5_conditional": np.nan}
+        return {"task": name, "n": 0, "top1_conditional": np.nan, "top5_conditional": np.nan}
 
     global_mode = _baseline_global(nxt)
-    top1_g = float((nxt == global_mode).mean())
 
     mode_map, top5_map = _baseline_conditional(cur, nxt)
     pred1 = cur.map(lambda x: mode_map.get(x, global_mode))
@@ -109,10 +215,13 @@ def evaluate_task(
     return {
         "task": name,
         "n": n,
-        "top1_global": top1_g,
         "top1_conditional": top1_c,
         "top5_conditional": top5_c,
     }
+
+
+def _disp(s: pd.Series) -> pd.Series:
+    return s.fillna("(missing)").astype(str)
 
 
 def main() -> None:
@@ -135,27 +244,40 @@ def main() -> None:
     eda = filter_eda_rows(df, max_gap)
 
     eda = eda.copy()
-    eda["next_group_name_s"] = eda["next_group_name"].fillna("(missing)").astype(str)
-    eda["DepartmentSpecialty_s"] = eda["DepartmentSpecialty"].fillna("(missing)").astype(str)
-    eda["next_department_specialty_s"] = eda["next_department_specialty"].fillna("(missing)").astype(str)
     eda["gap_label"] = eda["days_to_next_int"].map(days_to_gap_label)
 
-    rows = []
-    rows.append(evaluate_task("next_diagnosis_group", eda["GroupName_disp"], eda["next_group_name_s"]))
-    rows.append(
-        evaluate_task(
-            "next_department_specialty",
-            eda["DepartmentSpecialty_s"],
-            eda["next_department_specialty_s"],
-        )
-    )
-    rows.append(
-        evaluate_task(
-            "next_gap_bin_given_group",
-            eda["GroupName_disp"],
-            eda["gap_label"],
-        )
-    )
+    # Align with factorized heads: coalesce event_description with VisitTypeDescription when needed.
+    eda["event_desc_cur"] = _event_description_labels(eda)
+    gpat = eda.groupby("PatientDurableKey", sort=False)
+    eda["event_desc_next"] = gpat["event_desc_cur"].shift(-1)
+
+    eda["incoming_gap_label"] = _incoming_gap_labels(eda)
+
+    counts = eda.groupby("DepartmentKey", observed=False).size()
+    eda["facility_size_cur"] = eda["DepartmentKey"].map(lambda k: _volume_bin(counts.get(k, np.nan)))
+    eda["facility_size_next"] = eda.groupby("PatientDurableKey", sort=False)["facility_size_cur"].shift(-1)
+
+    eda["region_cur"] = _region_labels(eda)
+    eda["region_next"] = eda.groupby("PatientDurableKey", sort=False)["region_cur"].shift(-1)
+
+    eda["setting_cur"] = _setting_labels(eda)
+    eda["setting_next"] = eda.groupby("PatientDurableKey", sort=False)["setting_cur"].shift(-1)
+
+    eda["DepartmentSpecialty_s"] = eda["DepartmentSpecialty"].fillna("(missing)").astype(str)
+    eda["next_department_specialty_s"] = eda["next_department_specialty"].fillna("(missing)").astype(str)
+
+    rows = [
+        evaluate_task("dept_specialty", eda["DepartmentSpecialty_s"], eda["next_department_specialty_s"]),
+        evaluate_task("dept_type", _disp(eda["DepartmentType"]), _disp(eda["next_department_type"])),
+        evaluate_task("diagnosis_value", _disp(eda["DiagnosisValue"]), _disp(eda["next_diagnosis_value"])),
+        evaluate_task("event_description", eda["event_desc_cur"], eda["event_desc_next"]),
+        evaluate_task("facility_size", eda["facility_size_cur"], eda["facility_size_next"]),
+        evaluate_task("gap", eda["incoming_gap_label"].astype(str), eda["gap_label"].astype(str)),
+        evaluate_task("group_code", _disp(eda["GroupCode"]), _disp(eda["next_group_code"])),
+        evaluate_task("region", eda["region_cur"].astype(str), eda["region_next"].astype(str)),
+        evaluate_task("setting", eda["setting_cur"].astype(str), eda["setting_next"].astype(str)),
+        evaluate_task("type", _disp(eda["Type"]), _disp(eda["next_type"])),
+    ]
 
     out_csv = out_dir / "baseline_topk_metrics.csv"
     pd.DataFrame(rows).to_csv(out_csv, index=False)
@@ -164,21 +286,22 @@ def main() -> None:
     try:
         import matplotlib.pyplot as plt
 
-        fig, ax = plt.subplots(figsize=(8, 4))
+        n_tasks = len(rows)
+        fig_w = max(10.0, 0.72 * n_tasks)
+        fig, ax = plt.subplots(figsize=(fig_w, 4.8))
         tasks = [r["task"] for r in rows]
-        x = np.arange(len(tasks))
-        w = 0.25
-        ax.bar(x - w, [r["top1_global"] for r in rows], width=w, label="top-1 global marginal")
-        ax.bar(x, [r["top1_conditional"] for r in rows], width=w, label="top-1 given current")
-        ax.bar(x + w, [r["top5_conditional"] for r in rows], width=w, label="top-5 given current")
+        x = np.arange(n_tasks)
+        w = 0.35
+        ax.bar(x - w / 2, [r["top1_conditional"] for r in rows], width=w, label="top-1 given current")
+        ax.bar(x + w / 2, [r["top5_conditional"] for r in rows], width=w, label="top-5 given current")
         ax.set_xticks(x)
-        ax.set_xticklabels(tasks, rotation=15, ha="right")
+        ax.set_xticklabels(tasks, rotation=22, ha="right", fontsize=9)
         ax.set_ylim(0, 1)
         ax.set_ylabel("Accuracy")
         ax.set_title("Empirical baseline predictability (conditional frequencies)")
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=9)
         fig.text(0.5, 0.01, CAPTION, ha="center", fontsize=8)
-        fig.subplots_adjust(bottom=0.22)
+        fig.subplots_adjust(bottom=0.28)
         fig_path = out_dir / "baseline_topk_accuracy.png"
         fig.savefig(fig_path, dpi=150, bbox_inches="tight")
         plt.close(fig)

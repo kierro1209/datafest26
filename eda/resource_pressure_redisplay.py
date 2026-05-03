@@ -34,6 +34,11 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from eda.resource_pressure_eda import (  # noqa: E402
+    plot_diag_recurring_demand_bar,
+    plot_diag_volume_vs_return,
+)
+
 # Kept in sync with resource_pressure_eda.py (standalone import to avoid loading full pipeline).
 _BAD_DIMENSION_LABELS = frozenset(
     {
@@ -270,42 +275,6 @@ def plot_02_scatter(monthly: pd.DataFrame, out: Path, *, top_n: int = 12) -> Non
     plt.close(fig)
 
 
-def plot_03_diag_scatter(diag: pd.DataFrame, out: Path, *, label_top: int = 20, max_points: int = 80) -> None:
-    if len(diag) == 0:
-        return
-    dp = diag.sort_values("encounters", ascending=False).head(max_points).copy()
-    sizes = (dp["patients"] / max(dp["patients"].max(), 1) * 320 + 18).clip(18, 320)
-
-    fig, ax = plt.subplots(figsize=(11, 7))
-    ax.scatter(
-        dp["return_30d"],
-        dp["encounters"],
-        s=sizes,
-        alpha=0.55,
-        c="#2c5282",
-        edgecolors="white",
-        linewidths=0.35,
-    )
-    for _, row in dp.nlargest(label_top, "encounters").iterrows():
-        ax.annotate(
-            _truncate(row["GroupName_disp"], 40),
-            (row["return_30d"], row["encounters"]),
-            fontsize=7,
-            alpha=0.9,
-            xytext=(4, 3),
-            textcoords="offset points",
-            clip_on=True,
-        )
-
-    _pct_axis(ax, "x")
-    ax.set_xlabel("Share of linked encounters with a next visit within 30 days")
-    ax.set_ylabel("Encounter volume (distinct encounter IDs)")
-    ax.set_title("Diagnosis groups: 30-day return rate vs volume\n(bubble area scales with distinct patients; labels on highest-volume groups)")
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(_comma_int))
-    fig.savefig(out)
-    plt.close(fig)
-
-
 def plot_04_heatmap(stress: pd.DataFrame, out: Path, *, max_specialties: int = 35) -> None:
     if len(stress) == 0:
         return
@@ -356,12 +325,9 @@ def plot_04_heatmap(stress: pd.DataFrame, out: Path, *, max_specialties: int = 3
         ax.set_yticklabels(y_labels, fontsize=7)
         fig.colorbar(im, ax=ax, shrink=0.55, label="Stress score")
 
-    ax.set_xlabel("Month")
+    ax.set_xlabel("Time")
     ax.set_ylabel("Department specialty")
-    ax.set_title(
-        "Relative resource pressure by specialty and month\n"
-        "(composite rank score; descriptive only; unknown specialties omitted)"
-    )
+    ax.set_title("Specialty × time stress score")
     fig.savefig(out)
     plt.close(fig)
 
@@ -487,26 +453,9 @@ def main() -> None:
     if _HAS_SNS:
         sns.set_theme(style="whitegrid", context="notebook")
 
-    monthly_path = csv_dir / "monthly_specialty_pressure.csv"
     stress_path = csv_dir / "monthly_specialty_stress.csv"
     diag_path = csv_dir / "diag_group_repeat_pressure.csv"
     diagp_path = csv_dir / "diag_by_provider_specialty.csv"
-    weekly_path = csv_dir / "weekly_specialty_demand_z.csv"
-    sdoh_path = csv_dir / "sdoh_transport_pressure_by_diag.csv"
-
-    if monthly_path.is_file():
-        monthly = _clean_monthly_stress(pd.read_csv(monthly_path))
-        if len(monthly) > 0:
-            plot_01_monthly_lines(
-                monthly,
-                out_dir / "01_monthly_encounters_per_provider_by_specialty.png",
-                top_n=args.top_specialties_lines,
-            )
-            plot_02_scatter(
-                monthly,
-                out_dir / "02_monthly_encounters_vs_provider_count.png",
-                top_n=args.top_specialties_scatter,
-            )
 
     if stress_path.is_file():
         stress = _clean_monthly_stress(pd.read_csv(stress_path))
@@ -520,7 +469,8 @@ def main() -> None:
     if diag_path.is_file():
         diag = _clean_diag(pd.read_csv(diag_path))
         if len(diag) > 0:
-            plot_03_diag_scatter(diag, out_dir / "03_diag_volume_vs_return_30d.png")
+            plot_diag_volume_vs_return(diag, out_dir / "03_diag_volume_vs_return_30d.png")
+            plot_diag_recurring_demand_bar(diag, out_dir / "03_diag_recurring_demand_rank.png")
 
     if diagp_path.is_file():
         diagp = _clean_diag_provider(pd.read_csv(diagp_path))
@@ -531,20 +481,7 @@ def main() -> None:
                 top_n=args.top_bottlenecks,
             )
 
-    if weekly_path.is_file():
-        weekly = _clean_weekly(pd.read_csv(weekly_path))
-        if len(weekly) > 0:
-            plot_06_weekly_z(
-                weekly,
-                out_dir / "06_weekly_demand_zscore_by_specialty.png",
-                top_n=args.top_weekly_lines,
-            )
-
-    if sdoh_path.is_file():
-        sdoh = _clean_sdoh(pd.read_csv(sdoh_path))
-        if len(sdoh) > 0:
-            plot_07_sdoh(sdoh, out_dir / "07_sdoh_transport_return30d_top_diagnoses.png")
-
+    # Figures 01, 02, 06, 07 omitted from redisplay (same as resource_pressure_eda.py).
 
 if __name__ == "__main__":
     main()
