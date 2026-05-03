@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import math
@@ -590,16 +591,42 @@ def _first_available(payloads: list[dict[str, Any]], key: str, default: Any = No
     return default
 
 
-def load_prepared_pt(input_path: Path, vocab_path: Path | None = None) -> PreparedData:
-    log.info(
-        "Loading sequence artifact (large .pt files can take minutes before other logs appear): %s",
-        input_path.resolve(),
-    )
-    # Full prepared dicts require weights_only=False; use only on trusted local artifacts.
+def _load_sequence_artifact_dict(input_path: Path, *, mmap: bool) -> dict[str, Any]:
+    """Load the pickle dict from disk.
+
+    When ``mmap=True`` (default), PyTorch may memory-map tensor storages instead of fully
+    materializing them in RAM—often helpful for multi‑GB ``.pt`` files. Legacy pickle layouts
+    may ignore mmap; then we fall back to a normal load. True chunked/streaming load without
+    reading the whole archive requires exporting **sharded** ``.pt`` files (separate pipeline).
+    """
+    if mmap:
+        try:
+            raw = torch.load(input_path, map_location="cpu", weights_only=False, mmap=True)
+            log.info("Sequence artifact opened with tensor memory-mapping (mmap=True).")
+            return raw
+        except TypeError:
+            try:
+                raw = torch.load(input_path, map_location="cpu", mmap=True)
+                log.info("Sequence artifact opened with tensor memory-mapping (mmap=True).")
+                return raw
+            except TypeError:
+                pass
+        except (RuntimeError, OSError, ValueError) as e:
+            log.warning("mmap load failed (%s); falling back to full in-RAM deserialization.", e)
     try:
         raw = torch.load(input_path, map_location="cpu", weights_only=False)
     except TypeError:
         raw = torch.load(input_path, map_location="cpu")
+    log.info("Sequence artifact loaded with full in-RAM deserialization (mmap not used).")
+    return raw
+
+
+def load_prepared_pt(input_path: Path, vocab_path: Path | None = None, *, mmap_load: bool = True) -> PreparedData:
+    log.info(
+        "Loading sequence artifact (large .pt files can take minutes before other logs appear): %s",
+        input_path.resolve(),
+    )
+    raw = _load_sequence_artifact_dict(input_path, mmap=mmap_load)
     if not isinstance(raw, dict) or "sequences" not in raw:
         raise SystemExit(f"Unexpected PT artifact format: {input_path}")
 
@@ -755,7 +782,7 @@ def load_prepared_pt(input_path: Path, vocab_path: Path | None = None) -> Prepar
         }
     )
 
-    return PreparedData(
+    prepared = PreparedData(
         sequences=sequences,
         type_to_id=type_to_id,
         event_description_to_id=event_description_to_id,
@@ -778,6 +805,13 @@ def load_prepared_pt(input_path: Path, vocab_path: Path | None = None) -> Prepar
         external_per_token_dim=external_per_token_dim,
         external_feature_key=external_feature_key,
     )
+    del raw
+    gc.collect()
+    log.info(
+        "Released raw PT dict from RAM; holding %s prepared sequences for training.",
+        f"{len(sequences):,}",
+    )
+    return prepared
 
 
 def split_sequences(sequences: list[dict[str, Any]], valid_fraction: float, random_seed: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -1005,6 +1039,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train a multi-task autoregressive patient event sequence model.")
     p.add_argument("--input", type=Path, default=Path("token_sequence_model/patient_sequences_with_external_features.pt"))
     p.add_argument(
+        "--no-mmap-load",
+        action="store_true",
+        help="Disable memory-mapped tensor load for the sequence .pt (full RAM deserialize). Default uses mmap when PyTorch supports it to lower peak RAM on large files.",
+    )
+    p.add_argument(
         "--vocab-json",
         type=Path,
         default=Path("token_sequence_model/final_token_format.json"),
@@ -1135,7 +1174,7 @@ def main() -> None:
 
     if args.input.suffix != ".pt":
         raise SystemExit("This training script now expects the final tokenized .pt artifact as --input.")
-    prepared = load_prepared_pt(args.input, args.vocab_json)
+    prepared = load_prepared_pt(args.input, args.vocab_json, mmap_load=not args.no_mmap_load)
     if not prepared.sequences:
         raise SystemExit("No patient sequences with at least two events were found.")
 
