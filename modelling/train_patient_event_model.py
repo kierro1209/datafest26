@@ -1253,6 +1253,7 @@ def save_training_checkpoint(
     epoch_completed: int,
     history: list[dict[str, Any]],
     args: argparse.Namespace | None = None,
+    scheduler: Any | None = None,
 ) -> None:
     """Training-state checkpoint (not written until an epoch finishes all its run_epoch phases)."""
     payload: dict[str, Any] = {
@@ -1267,7 +1268,34 @@ def save_training_checkpoint(
     }
     if args is not None:
         payload["args"] = vars(args)
+    if scheduler is not None:
+        payload["scheduler_state_dict"] = scheduler.state_dict()
     _atomic_torch_save(payload, path)
+
+
+def _restore_torch_rng_state(rs: Any) -> None:
+    """Restore PyTorch CPU RNG state; tolerate dtype/device quirks after torch.load."""
+    if rs is None:
+        return
+    try:
+        if torch.is_tensor(rs):
+            t = rs.detach().cpu().contiguous()
+            if t.dtype == torch.uint8:
+                torch.set_rng_state(t)
+                return
+            # torch.load sometimes revives uint8 state as another dtype; reinterpret bytes.
+            raw = t.numpy().tobytes()
+            torch.set_rng_state(torch.frombuffer(bytearray(raw), dtype=torch.uint8).clone())
+            return
+        arr = np.asarray(rs)
+        if arr.dtype != np.uint8:
+            arr = np.frombuffer(arr.tobytes(), dtype=np.uint8)
+        torch.set_rng_state(torch.from_numpy(np.ascontiguousarray(arr)))
+    except Exception as exc:
+        log.warning(
+            "Could not restore torch RNG state from checkpoint (%s); continuing without RNG restore.",
+            exc,
+        )
 
 
 def load_training_checkpoint(
@@ -1275,15 +1303,31 @@ def load_training_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    scheduler: Any | None = None,
 ) -> tuple[int, list[dict[str, Any]]]:
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     epoch_done = int(ckpt.get("epoch", 0))
     history = list(ckpt.get("history", []))
-    rs = ckpt.get("torch_rng_state")
-    if rs is not None:
-        torch.set_rng_state(rs)
+    sd_sched = ckpt.get("scheduler_state_dict")
+    sched_loaded = False
+    if scheduler is not None:
+        if isinstance(sd_sched, dict):
+            try:
+                scheduler.load_state_dict(sd_sched)
+                sched_loaded = True
+            except Exception as exc:
+                log.warning("Could not load LR scheduler state from checkpoint (%s).", exc)
+        if not sched_loaded and epoch_done > 0:
+            log.info(
+                "LR scheduler: applying %s scheduler.step() call(s) to match resumed epoch "
+                "(checkpoint has no usable scheduler state).",
+                epoch_done,
+            )
+            for _ in range(epoch_done):
+                scheduler.step()
+    _restore_torch_rng_state(ckpt.get("torch_rng_state"))
     nprs = ckpt.get("numpy_rng_state")
     if nprs is not None:
         np.random.set_state(nprs)
@@ -1464,7 +1508,10 @@ def parse_args() -> argparse.Namespace:
         "--resume",
         type=Path,
         default=None,
-        help="Resume from checkpoint_last.pt (or any save_training_checkpoint file). Same --input/vocab/architecture.",
+        help="Resume from checkpoint_last.pt (or any save_training_checkpoint file). Same --input/vocab/architecture. "
+        "Set --epochs to the **total** desired epochs (e.g. 10 after a 3-epoch run). "
+        "With --no-incremental-metrics unset, training_metrics.jsonl is appended (not wiped); train.log should use the same --log-file path. "
+        "Checkpoints saved after this version include LR scheduler state; older checkpoints advance the scheduler by completed epoch count.",
     )
     p.add_argument(
         "--no-save-best",
@@ -1491,7 +1538,7 @@ def main() -> None:
     handlers: list[logging.Handler] = [logging.StreamHandler()]
     if args.log_file is not None:
         args.log_file.parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
+        handlers.append(logging.FileHandler(args.log_file, mode="a", encoding="utf-8"))
     logging.basicConfig(level=level, format=fmt, datefmt=datefmt, handlers=handlers, force=True)
     if args.log_file is not None:
         log.info("Also writing log lines to %s", args.log_file.resolve())
@@ -1732,11 +1779,13 @@ def main() -> None:
     log_batch_iv = max(0, int(args.log_batch_interval))
 
     if not args.no_incremental_metrics:
-        reset_incremental_metric_files(args.output_dir)
+        if args.resume is None:
+            reset_incremental_metric_files(args.output_dir)
         log.info(
-            "Incremental metrics: %s (one JSON object per epoch) and %s (full history after each epoch)",
+            "Incremental metrics: %s (one JSON object per epoch) and %s (full history after each epoch)%s",
             args.output_dir / "training_metrics.jsonl",
             args.output_dir / "training_history_snapshot.json",
+            " — appending to existing files (resume)" if args.resume is not None else "",
         )
 
     ckpt_last = args.output_dir / "checkpoint_last.pt"
@@ -1746,7 +1795,9 @@ def main() -> None:
     if args.resume is not None:
         if not args.resume.exists():
             raise SystemExit(f"Resume checkpoint not found: {args.resume}")
-        start_epoch, history = load_training_checkpoint(args.resume, model, optimizer, device)
+        start_epoch, history = load_training_checkpoint(
+            args.resume, model, optimizer, device, scheduler=scheduler
+        )
         log.info(
             "Resumed from %s | last completed epoch=%s | history_len=%s",
             args.resume.resolve(),
@@ -1878,7 +1929,9 @@ def main() -> None:
 
             # .pt checkpoints only after full epoch (train → val → test for temporal; train → val for holdout).
             if args.checkpoint_every > 0 and epoch % args.checkpoint_every == 0:
-                save_training_checkpoint(ckpt_last, model, optimizer, epoch, history, args)
+                save_training_checkpoint(
+                    ckpt_last, model, optimizer, epoch, history, args, scheduler=scheduler
+                )
                 log.info("Checkpoint saved after full epoch %s: %s", epoch, ckpt_last.resolve())
 
             if not args.no_save_best:
@@ -1891,7 +1944,9 @@ def main() -> None:
                     and float(vl_best) < best_valid_loss
                 ):
                     best_valid_loss = float(vl_best)
-                    save_training_checkpoint(ckpt_best, model, optimizer, epoch, history, args)
+                    save_training_checkpoint(
+                        ckpt_best, model, optimizer, epoch, history, args, scheduler=scheduler
+                    )
                     log.info("New best valid total loss=%.6f -> %s", best_valid_loss, ckpt_best.resolve())
 
             last_completed_epoch = epoch
@@ -1903,7 +1958,15 @@ def main() -> None:
             ckpt_last,
         )
         if args.checkpoint_every != 0 and last_completed_epoch > start_epoch:
-            save_training_checkpoint(ckpt_last, model, optimizer, last_completed_epoch, history, args)
+            save_training_checkpoint(
+                ckpt_last,
+                model,
+                optimizer,
+                last_completed_epoch,
+                history,
+                args,
+                scheduler=scheduler,
+            )
         raise SystemExit(130) from None
 
     save_artifacts(args.output_dir, prepared, model, history, args)

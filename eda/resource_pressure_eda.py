@@ -823,6 +823,71 @@ def plot_diag_provider_bottlenecks(
     plt.close(fig)
 
 
+def plot_relative_pressure_quadrant(
+    monthly_stress: pd.DataFrame,
+    out: Path,
+    *,
+    max_points: int = 5000,
+) -> None:
+    """
+    Exploratory quadrant chart: volume vs near-term return proxy, bubble ~ encounters/provider.
+
+    Descriptive only — not staffing capacity or shortage.
+    """
+    needed = {"encounters", "return_30d", "providers", "stress_score"}
+    if monthly_stress is None or len(monthly_stress) == 0:
+        return
+    if not needed.issubset(monthly_stress.columns):
+        logger.warning("Skipping quadrant chart: missing columns")
+        return
+    sub = monthly_stress.dropna(subset=["encounters", "return_30d"]).copy()
+    sub["providers"] = sub["providers"].replace(0, np.nan)
+    sub["epp"] = sub["encounters"].astype(float) / sub["providers"].astype(float)
+    sub = sub.dropna(subset=["epp"])
+    if len(sub) == 0:
+        return
+    if len(sub) > max_points:
+        sub = sub.sample(max_points, random_state=42)
+
+    x = sub["encounters"].astype(float)
+    y = sub["return_30d"].astype(float)
+    sz = sub["epp"].astype(float)
+    sz = (sz / sz.quantile(0.95) * 350 + 25).clip(25, 400)
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+    sc = ax.scatter(
+        x,
+        y,
+        s=sz,
+        c=sub["stress_score"].astype(float),
+        alpha=0.45,
+        cmap="viridis",
+        edgecolors="none",
+    )
+    mx = float(x.median())
+    my = float(y.median())
+    ax.axvline(mx, color="0.4", ls="--", lw=0.9)
+    ax.axhline(my, color="0.4", ls="--", lw=0.9)
+    ax.set_xlabel("Monthly encounters (distinct EncounterKey)")
+    ax.set_ylabel("Proxy: mean P(next visit within 30 days) for specialty-month (linked pairs)")
+    ax.set_title(
+        "Relative pressure view — encounters vs near-term return proxy (bubble ~ encounters per observed provider)"
+    )
+    fig.colorbar(sc, ax=ax, label="stress_score (rank-sum composite)")
+    fig.text(
+        0.5,
+        0.02,
+        "Denominator for return proxy: linked encounters contributing to each specialty-month bin. "
+        "Provider counts are observed chart identifiers, not labor capacity.",
+        ha="center",
+        fontsize=8,
+    )
+    fig.subplots_adjust(bottom=0.12)
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_weekly_demand_z(
     weekly: pd.DataFrame,
     out: Path,
@@ -926,6 +991,17 @@ def run_all(args: argparse.Namespace) -> None:
         out_dir / "04_specialty_month_stress_heatmap.png",
         max_specialties=args.heatmap_specialties,
     )
+    if getattr(args, "quadrant_chart", False):
+        tq = time.perf_counter()
+        plot_relative_pressure_quadrant(
+            monthly_stress,
+            out_dir / "08_specialty_month_relative_pressure_quadrant.png",
+        )
+        logger.info(
+            "Quadrant chart %.2fs → %s",
+            time.perf_counter() - tq,
+            out_dir / "08_specialty_month_relative_pressure_quadrant.png",
+        )
     plot_diag_provider_bottlenecks(
         diag_provider,
         out_dir / "05_top_diag_provider_specialty_bottlenecks.png",
@@ -1035,6 +1111,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+    )
+    p.add_argument(
+        "--quadrant-chart",
+        action="store_true",
+        help="Also write 08_specialty_month_relative_pressure_quadrant.png (descriptive proxies only).",
     )
     return p.parse_args(argv)
 

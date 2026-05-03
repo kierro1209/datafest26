@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 import time
 import textwrap
 from pathlib import Path
@@ -44,8 +45,24 @@ except ImportError:
 import matplotlib.pyplot as plt
 
 _ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from eda.gap_bins import ORDERED_GAP_LABELS_INTER_ENCOUNTER, days_to_gap_label
 
 logger = logging.getLogger(__name__)
+
+# Figure captions — denominator disclosure (see eda/README_story_eda.md).
+CAPTION_LINKED_PAIRS = (
+    "Denominator: linked encounters only (rows with an observed next encounter in this extract)."
+)
+CAPTION_ALL_ENCOUNTERS = (
+    "Denominator: all encounters; terminal encounters (no observed next in extract) counted separately; "
+    "note right-censoring near end of calendar coverage."
+)
+CAPTION_TRANSITION_ASSOC = (
+    "Empirical association only (not causal): P(next label | current row), row-normalized."
+)
 
 
 def configure_logging(level: int) -> None:
@@ -323,6 +340,261 @@ def plot_survival_style_returns(eda: pd.DataFrame, out: Path, top_n: int = 10) -
     plt.close(fig)
 
 
+def _footnote(fig, text: str, y: float = 0.02) -> None:
+    fig.text(0.5, y, text, ha="center", fontsize=8, wrap=True)
+
+
+def plot_gap_bin_by_diagnosis_linked_pairs(
+    eda: pd.DataFrame,
+    out: Path,
+    *,
+    top_n: int = 20,
+    max_gap_filter_days: int | None = None,
+) -> None:
+    """Stacked 100% bars: gap token bins vs diagnosis group (linked pairs only)."""
+    sub = eda.copy()
+    if max_gap_filter_days is not None:
+        sub = sub[sub["days_to_next_int"].astype(float) <= max_gap_filter_days]
+    vc = sub["GroupName_disp"].value_counts()
+    top = vc.head(top_n).index
+    sub = sub[sub["GroupName_disp"].isin(top)]
+    sub["gap_token_bin"] = sub["days_to_next_int"].map(days_to_gap_label)
+    order = [x for x in ORDERED_GAP_LABELS_INTER_ENCOUNTER if x in sub["gap_token_bin"].unique()]
+    extra = [x for x in sub["gap_token_bin"].unique() if x not in order]
+    cat_order = order + sorted(extra)
+    ct = pd.crosstab(sub["GroupName_disp"], sub["gap_token_bin"])
+    ct = ct.reindex(columns=[c for c in cat_order if c in ct.columns], fill_value=0)
+    row_sum = ct.sum(axis=1).replace(0, np.nan)
+    pct = ct.div(row_sum, axis=0).fillna(0)
+
+    fig, ax = plt.subplots(figsize=(12, max(5, top_n * 0.32)))
+    pct.plot(kind="barh", stacked=True, ax=ax, width=0.85, legend=True)
+    ax.set_xlabel("Share of linked pairs")
+    ax.set_ylabel("Current diagnosis group")
+    filt = f" (next within ≤{max_gap_filter_days}d)" if max_gap_filter_days is not None else ""
+    ax.set_title(
+        "Time to next encounter (token gap bins) by diagnosis group"
+        + filt
+        + "\nBins align with model gap_ids vocabulary."
+    )
+    ax.legend(title="Gap bin", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
+    fig.tight_layout()
+    _footnote(fig, CAPTION_LINKED_PAIRS + " " + CAPTION_TRANSITION_ASSOC)
+    fig.subplots_adjust(bottom=0.14)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_specialty_transition_heatmap_linked_pairs(
+    eda: pd.DataFrame,
+    out: Path,
+    *,
+    top_n: int = 20,
+    horizon_days: int | None = None,
+) -> None:
+    """Department specialty → next department specialty (linked pairs; empirical association)."""
+    sub = eda.copy()
+    if horizon_days is not None:
+        sub = sub[sub["days_to_next_int"].astype(float) <= horizon_days]
+    sub["DepartmentSpecialty_disp"] = sub["DepartmentSpecialty"].fillna("(missing)").astype(str)
+    sub["next_department_specialty_disp"] = sub["next_department_specialty"].fillna("(missing)").astype(str)
+    vc = sub["DepartmentSpecialty_disp"].value_counts()
+    top = vc.head(top_n).index
+    trans = sub[sub["DepartmentSpecialty_disp"].isin(top) & sub["next_department_specialty_disp"].notna()].copy()
+    trans = trans[trans["next_department_specialty_disp"].isin(top)]
+    if len(trans) < 100:
+        logger.warning(
+            "Skipping specialty heatmap: only %s transition rows in top specialties (need ≥100)",
+            len(trans),
+        )
+        return
+    mat = pd.crosstab(
+        trans["DepartmentSpecialty_disp"],
+        trans["next_department_specialty_disp"],
+        normalize="index",
+    )
+    suf = f" — next within ≤{horizon_days}d" if horizon_days else ""
+    fig, ax = plt.subplots(figsize=(14, 12))
+    if _HAS_SNS:
+        sns.heatmap(mat, cmap="Greens", ax=ax, cbar_kws={"label": "P(next specialty | current)"})
+    else:
+        im = ax.imshow(mat.values, aspect="auto", cmap="Greens")
+        ax.set_xticks(range(len(mat.columns)))
+        ax.set_xticklabels(mat.columns, rotation=90, fontsize=6)
+        ax.set_yticks(range(len(mat.index)))
+        ax.set_yticklabels(mat.index, fontsize=6)
+        fig.colorbar(im, ax=ax, label="P(next | current)")
+    ax.set_xlabel("Next department specialty (next observed encounter)")
+    ax.set_ylabel("Current department specialty")
+    ax.set_title(f"Empirical specialty transitions (top {top_n}){suf}")
+    fig.tight_layout()
+    cap = CAPTION_LINKED_PAIRS
+    if horizon_days is not None:
+        cap += f" Pairs subset to days_to_next ≤ {horizon_days} before counts."
+    cap += " " + CAPTION_TRANSITION_ASSOC
+    _footnote(fig, cap)
+    fig.subplots_adjust(bottom=0.12)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_return_exclusive_bins_linked_pairs(
+    eda: pd.DataFrame,
+    out: Path,
+    *,
+    top_n: int = 20,
+) -> None:
+    """Mutually exclusive bins on days_to_next for linked pairs only."""
+    eda = eda[~eda["GroupName_disp"].astype(str).str.lower().str.contains("missing")]
+    vc = eda["GroupName_disp"].value_counts()
+    top = vc.head(top_n).index
+    sub = eda[eda["GroupName_disp"].isin(top)].copy()
+    d = sub["days_to_next_int"].astype(float)
+
+    def _bin(x: float) -> str:
+        if pd.isna(x):
+            return "unknown"
+        xi = int(x)
+        if xi <= 7:
+            return "0–7d"
+        if xi <= 30:
+            return "8–30d"
+        if xi <= 90:
+            return "31–90d"
+        if xi <= 365:
+            return "91–365d"
+        return ">365d"
+
+    sub["_rb"] = d.map(_bin)
+    bins_order = ["0–7d", "8–30d", "31–90d", "91–365d", ">365d"]
+    rows = []
+    for gname in top:
+        part = sub.loc[sub["GroupName_disp"] == gname, "_rb"]
+        n = len(part)
+        row = {"GroupName_disp": gname, "n": n}
+        for b in bins_order:
+            row[b] = float((part == b).mean()) if n else 0.0
+        rows.append(row)
+    rate_df = pd.DataFrame(rows)
+    rate_df["GroupName_disp"] = rate_df["GroupName_disp"].apply(lambda x: str(x).split(",")[0])
+
+    fig, ax = plt.subplots(figsize=(11, 6))
+    x = np.arange(len(rate_df))
+    w = 0.14
+    for i, b in enumerate(bins_order):
+        ax.bar(x + i * w, rate_df[b], width=w, label=b)
+    ax.set_xticks(x + w * (len(bins_order) / 2 - 0.5))
+    ax.set_xticklabels(rate_df["GroupName_disp"], rotation=35, ha="right", fontsize=8)
+    ax.set_ylabel("Share of linked pairs (mutually exclusive)")
+    ax.set_title("Time to next encounter by diagnosis group — mutually exclusive gap bins")
+    ax.legend(title="Gap to next visit", fontsize=7)
+    ax.set_ylim(0, 1)
+    fig.tight_layout()
+    _footnote(fig, CAPTION_LINKED_PAIRS + " Bins partition rows with a known next encounter.")
+    fig.subplots_adjust(bottom=0.18)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_return_simple30_linked_pairs(eda: pd.DataFrame, out: Path, *, top_n: int = 20) -> None:
+    eda = eda[~eda["GroupName_disp"].astype(str).str.lower().str.contains("missing")]
+    vc = eda["GroupName_disp"].value_counts()
+    top = vc.head(top_n).index
+    sub = eda[eda["GroupName_disp"].isin(top)]
+    rows = []
+    for gname in top:
+        part = sub.loc[sub["GroupName_disp"] == gname, "days_to_next_int"].astype(float)
+        n = len(part)
+        within30 = float((part <= 30).mean()) if n else np.nan
+        rows.append({"GroupName_disp": str(gname).split(",")[0], "n": n, "pct_next_within_30d": within30})
+    rate_df = pd.DataFrame(rows).sort_values("pct_next_within_30d", ascending=False)
+
+    fig, ax = plt.subplots(figsize=(10, max(5, top_n * 0.28)))
+    y_pos = np.arange(len(rate_df))
+    ax.barh(y_pos, rate_df["pct_next_within_30d"].astype(float), color="steelblue")
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(rate_df["GroupName_disp"])
+    for yi, (_, r) in enumerate(rate_df.iterrows()):
+        ax.text(
+            float(r["pct_next_within_30d"]) + 0.01,
+            yi,
+            f"n={int(r['n']):,}",
+            va="center",
+            fontsize=7,
+        )
+    ax.set_xlabel("Share of linked pairs with next visit within 30 days")
+    ax.set_title("Near-term follow-up intensity by diagnosis group (top by volume)")
+    ax.set_xlim(0, 1.15)
+    fig.tight_layout()
+    _footnote(fig, CAPTION_LINKED_PAIRS)
+    fig.subplots_adjust(bottom=0.12)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_full_cohort_return_exclusive_bins(
+    df: pd.DataFrame,
+    out: Path,
+    *,
+    top_n: int = 20,
+) -> None:
+    """All encounters: terminal = no observed next; mutually exclusive time bins otherwise."""
+    df = df.copy()
+    df["GroupName_disp"] = df["GroupName"].fillna("(missing)").astype(str)
+    vc = df["GroupName_disp"].value_counts()
+    top = vc.head(top_n).index
+    sub = df[df["GroupName_disp"].isin(top)]
+
+    def row_bin(row: pd.Series) -> str:
+        if pd.isna(row.get("next_event_datetime")):
+            return "no_observed_next"
+        x = row.get("days_to_next_int")
+        if pd.isna(x):
+            return "no_observed_next"
+        try:
+            xi = int(float(x))
+        except (TypeError, ValueError):
+            return "unknown"
+        if xi <= 7:
+            return "0–7d"
+        if xi <= 30:
+            return "8–30d"
+        if xi <= 90:
+            return "31–90d"
+        if xi <= 365:
+            return "91–365d"
+        return ">365d"
+
+    sub["_rb"] = sub.apply(row_bin, axis=1)
+    bins_order = ["no_observed_next", "0–7d", "8–30d", "31–90d", "91–365d", ">365d"]
+    rows = []
+    for gname in top:
+        part = sub.loc[sub["GroupName_disp"] == gname, "_rb"]
+        n = len(part)
+        row = {"GroupName_disp": str(gname).split(",")[0], "n": n}
+        for b in bins_order:
+            row[b] = float((part == b).mean()) if n else 0.0
+        rows.append(row)
+    rate_df = pd.DataFrame(rows)
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    x = np.arange(len(rate_df))
+    w = 0.11
+    for i, b in enumerate(bins_order):
+        ax.bar(x + i * w, rate_df[b], width=w, label=b)
+    ax.set_xticks(x + w * (len(bins_order) / 2 - 0.5))
+    ax.set_xticklabels(rate_df["GroupName_disp"], rotation=35, ha="right", fontsize=8)
+    ax.set_ylabel("Share of all encounters in group")
+    ax.set_title("Next-visit timing vs terminal encounters — full cohort (mutually exclusive bins)")
+    ax.legend(title="Outcome", fontsize=7, loc="center left", bbox_to_anchor=(1.02, 0.5))
+    ax.set_ylim(0, 1)
+    fig.tight_layout()
+    _footnote(fig, CAPTION_ALL_ENCOUNTERS)
+    fig.subplots_adjust(bottom=0.18, right=0.82)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_department_transition_heatmap(eda: pd.DataFrame, out: Path) -> None:
     trans = eda.dropna(subset=["DepartmentType_disp", "next_department_type_disp"])
     if len(trans) < 100:
@@ -354,7 +626,14 @@ def plot_department_transition_heatmap(eda: pd.DataFrame, out: Path) -> None:
     plt.close(fig)
 
 
-def plot_diagnosis_transition_heatmap(eda: pd.DataFrame, out: Path, top_n: int = 35) -> None:
+def plot_diagnosis_transition_heatmap(
+    eda: pd.DataFrame,
+    out: Path,
+    top_n: int = 35,
+    *,
+    title_suffix: str = "",
+    denominator_line: str | None = None,
+) -> None:
     vc = eda["GroupName_disp"].value_counts()
     top = vc.head(top_n).index
     trans = eda[
@@ -380,11 +659,16 @@ def plot_diagnosis_transition_heatmap(eda: pd.DataFrame, out: Path, top_n: int =
         ax.set_yticks(range(len(mat.index)))
         ax.set_yticklabels(mat.index, fontsize=6)
         fig.colorbar(im, ax=ax, label="P(next | current)")
-    ax.set_xlabel("Next diagnosis group")
+    ax.set_xlabel("Next diagnosis group (next observed encounter)")
     ax.set_ylabel("Current diagnosis group")
-    ax.set_title(f"Diagnosis group transitions (top {top_n} groups, row-normalized)")
+    ax.set_title(f"Diagnosis group transitions (top {top_n} groups, row-normalized){title_suffix}")
     fig.tight_layout()
-    fig.savefig(out, dpi=150)
+    cap = denominator_line if denominator_line is not None else (
+        CAPTION_LINKED_PAIRS + " " + CAPTION_TRANSITION_ASSOC
+    )
+    _footnote(fig, cap)
+    fig.subplots_adjust(bottom=0.10)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -560,6 +844,23 @@ def write_repeat_location_summary(eda: pd.DataFrame, out_csv: Path) -> None:
     pd.DataFrame(rows, columns=["metric", "rate"]).to_csv(out_csv, index=False)
 
 
+def write_top_three_step_specialty_paths(df: pd.DataFrame, out_csv: Path, *, top_m: int = 40) -> None:
+    """Three-step department-specialty chains (encounter order); counts only."""
+    df = df.sort_values(["PatientDurableKey", "event_datetime", "EncounterKey"])
+    paths: list[str] = []
+    for _, block in df.groupby("PatientDurableKey", sort=False):
+        specs = block["DepartmentSpecialty"].fillna("(missing)").astype(str).tolist()
+        for i in range(len(specs) - 2):
+            paths.append(" → ".join(specs[i : i + 3]))
+    if not paths:
+        logger.warning("No 3-step specialty paths to write")
+        return
+    vc = pd.Series(paths).value_counts().head(top_m)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    vc.rename("count").to_csv(out_csv)
+    logger.info("Wrote top %s specialty pathways → %s", top_m, out_csv)
+
+
 def write_gap_by_group_csv(eda: pd.DataFrame, out_csv: Path, top_n: int = 50) -> None:
     vc = eda["GroupName_disp"].value_counts()
     top = vc.head(top_n).index
@@ -642,7 +943,14 @@ def run_all(args: argparse.Namespace) -> None:
         ("02_median_gap_top_diagnosis_groups.png", lambda: plot_median_gap_by_group(eda, out_dir / "02_median_gap_top_diagnosis_groups.png")),
         ("03_return_within_7_14_30_90_by_group.png", lambda: plot_survival_style_returns(eda, out_dir / "03_return_within_7_14_30_90_by_group.png")),
         ("04_department_type_transition_heatmap.png", lambda: plot_department_transition_heatmap(eda, out_dir / "04_department_type_transition_heatmap.png")),
-        ("05_diagnosis_group_transition_heatmap.png", lambda: plot_diagnosis_transition_heatmap(eda, out_dir / "05_diagnosis_group_transition_heatmap.png")),
+        (
+            "05_diagnosis_group_transition_heatmap.png",
+            lambda: plot_diagnosis_transition_heatmap(
+                eda,
+                out_dir / "05_diagnosis_group_transition_heatmap.png",
+                top_n=args.diagnosis_heatmap_top_n,
+            ),
+        ),
         ("06_diagnosis_group_persistence.png", lambda: plot_diagnosis_persistence(eda, out_dir / "06_diagnosis_group_persistence.png")),
         ("07_sdoh_transport_vs_visit_gap.png", lambda: plot_sdoh_transport_comparison(eda, out_dir / "07_sdoh_transport_vs_visit_gap.png")),
     ]
@@ -656,6 +964,50 @@ def run_all(args: argparse.Namespace) -> None:
             logger.info("Wrote %s (%.2fs)", name, elapsed)
         else:
             logger.warning("Did not produce %s — plot skipped or failed (%.2fs)", name, elapsed)
+
+    if args.run_predictability_plots:
+        tn = args.predictability_top_n
+        t_pred = time.perf_counter()
+        plot_gap_bin_by_diagnosis_linked_pairs(
+            eda, out_dir / "10_gap_bin_token_aligned_linked_pairs.png", top_n=tn
+        )
+        plot_specialty_transition_heatmap_linked_pairs(
+            eda, out_dir / "11_specialty_next_specialty_transition_topK.png", top_n=tn
+        )
+        plot_return_exclusive_bins_linked_pairs(
+            eda, out_dir / "12_return_exclusive_bins_linked_pairs.png", top_n=tn
+        )
+        plot_return_simple30_linked_pairs(
+            eda, out_dir / "13_return_within_30d_simple_linked_pairs.png", top_n=tn
+        )
+        if args.full_cohort_return_chart:
+            plot_full_cohort_return_exclusive_bins(
+                df, out_dir / "14_full_cohort_return_exclusive_bins.png", top_n=tn
+            )
+        if args.transition_max_gap_days is not None:
+            g = int(args.transition_max_gap_days)
+            eda_sub = eda[eda["days_to_next_int"].astype(float) <= g]
+            plot_diagnosis_transition_heatmap(
+                eda_sub,
+                out_dir / f"05b_diagnosis_transition_within_{g}d.png",
+                top_n=args.diagnosis_heatmap_top_n,
+                title_suffix=f" — pairs with days_to_next ≤ {g}d",
+                denominator_line=(
+                    CAPTION_LINKED_PAIRS
+                    + f" Subset: days_to_next ≤ {g}d before row normalization. "
+                    + CAPTION_TRANSITION_ASSOC
+                ),
+            )
+            plot_specialty_transition_heatmap_linked_pairs(
+                eda,
+                out_dir / f"11b_specialty_transition_within_{g}d.png",
+                top_n=tn,
+                horizon_days=g,
+            )
+        write_top_three_step_specialty_paths(
+            df, out_dir / "pathways_top_specialty_three_step.csv", top_m=40
+        )
+        logger.info("Predictability plots finished in %.2fs", time.perf_counter() - t_pred)
 
     t_csv = time.perf_counter()
     write_repeat_location_summary(eda, out_dir / "summary_repeat_location_rates.csv")
@@ -738,6 +1090,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         help="Console logging verbosity (default INFO).",
     )
+    p.add_argument(
+        "--no-predictability-plots",
+        action="store_true",
+        help="Skip gap-bin, specialty transition, exclusive return, simple-30d, full-cohort plots (10–14).",
+    )
+    p.add_argument(
+        "--predictability-top-n",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Top-N diagnosis groups / specialties for predictability figures (default 20).",
+    )
+    p.add_argument(
+        "--diagnosis-heatmap-top-n",
+        type=int,
+        default=35,
+        metavar="N",
+        help="Top-N groups for main diagnosis transition heatmap (05).",
+    )
+    p.add_argument(
+        "--transition-max-gap-days",
+        type=int,
+        default=None,
+        metavar="D",
+        help="Also write horizon-filtered diagnosis/specialty heatmaps (05b, 11b) with days_to_next ≤ D.",
+    )
+    p.add_argument(
+        "--no-full-cohort-return-chart",
+        action="store_true",
+        help="Skip full-cohort mutually exclusive return chart (14) when predictability plots run.",
+    )
     return p.parse_args(argv)
 
 
@@ -748,6 +1131,8 @@ def main(argv: list[str] | None = None) -> None:
         args.max_gap_days = None
     elif args.max_gap_days is not None and args.max_gap_days < 0:
         raise SystemExit("--max-gap-days must be non-negative")
+    args.full_cohort_return_chart = not args.no_full_cohort_return_chart
+    args.run_predictability_plots = not args.no_predictability_plots
     run_all(args)
 
 
