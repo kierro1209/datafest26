@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Patient journey predictability EDA — run from datafest26 repo root.
-set -euo pipefail
+# Note: no `set -u` — empty EXTRA=() + "${EXTRA[@]}" trips nounset on Bash 3.2 / some setups.
+set -eo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 

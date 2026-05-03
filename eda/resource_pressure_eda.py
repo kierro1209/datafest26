@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import gc
 import logging
+import re
 import sys
 import time
 from pathlib import Path
@@ -31,7 +32,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import matplotlib.patheffects as mpathfx
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+from matplotlib.lines import Line2D
 
 try:
     import seaborn as sns
@@ -711,42 +715,258 @@ def plot_encounters_vs_providers_scatter(
     plt.close(fig)
 
 
+# Shared caption for diagnosis demand figures (linked-pair slice).
+DIAG_DEMAND_FOOTNOTE = (
+    "Denominator: linked encounters with observed next-visit timing in this extract. "
+    "30-day revisit rate is the share of encounters with a subsequent visit within 30 days, "
+    "among pairs where a next visit is observed (terminal / censored ends excluded from the numerator)."
+)
+
+
+def _short_diag_tag(raw: object, *, max_chars: int = 18) -> str:
+    """Compress diagnosis group labels for plot annotations (core phrase, not full string)."""
+    s = str(raw).strip()
+    if not s or s.lower() in ("nan", "none"):
+        return "?"
+    for sep in (" — ", " – ", " - ", " | ", ";"):
+        if sep in s:
+            s = s.split(sep)[0].strip()
+            break
+    s = re.sub(r"\s*\([^)]*\)\s*$", "", s).strip()
+    if len(s) <= max_chars:
+        return s
+    words = s.split()
+    parts: list[str] = []
+    n = 0
+    for w in words:
+        if n + len(w) + len(parts) > max_chars - 1:
+            break
+        parts.append(w)
+        n += len(w) + 1
+    tag = " ".join(parts)
+    return (tag + "…")[:max_chars]
+
+
 def plot_diag_volume_vs_return(
     diag_pressure: pd.DataFrame,
     out: Path,
     *,
-    label_top_n: int = 25,
+    label_top_n: int = 10,
     max_groups_plot: int = 80,
 ) -> None:
+    """Quadrant scatter: revisit rate vs encounter volume (log), medians, labels by recurring-demand rank."""
     if len(diag_pressure) == 0:
         logger.warning("Skipping diagnosis volume vs return plot: empty diag_pressure")
         return
 
-    dp = diag_pressure.sort_values("encounters", ascending=False).head(max_groups_plot)
+    dp = diag_pressure.sort_values("encounters", ascending=False).head(max_groups_plot).copy()
+    dp["recurring_demand"] = dp["encounters"].astype(float) * dp["return_30d"].astype(float)
+    vol = dp["encounters"].astype(float).clip(lower=1.0)
+    rv = dp["return_30d"].astype(float)
+    median_rate = float(rv.median())
+    median_vol = float(vol.median())
 
-    fig, ax = plt.subplots(figsize=(10, 7))
-    sizes = (dp["patients"] / dp["patients"].max() * 350 + 15).clip(15, 350)
-    ax.scatter(dp["return_30d"], dp["encounters"], s=sizes, alpha=0.55, c="steelblue")
+    fig, ax = plt.subplots(figsize=(10, 7.8))
+    fig.patch.set_facecolor("#ffffff")
+    ax.set_facecolor("#f8fafc")
+    ax.set_axisbelow(True)
 
-    top_labels = dp.nlargest(label_top_n, "encounters")
-    for _, row in top_labels.iterrows():
-        ax.annotate(
-            str(row["GroupName_disp"])[:35],
-            (row["return_30d"], row["encounters"]),
-            fontsize=6,
-            alpha=0.85,
-            xytext=(4, 4),
-            textcoords="offset points",
-        )
+    pat = dp["patients"].astype(float)
+    smax = float(pat.max()) if len(pat) else 1.0
+    sizes = (pat / max(smax, 1.0) * 90 + 42).clip(42, 160)
 
-    ax.set_xlabel("Share of encounters with next visit within 30 days")
-    ax.set_ylabel("Encounter volume (distinct EncounterKey)")
-    ax.set_title(
-        "Diagnosis groups: near-term return rate vs volume "
-        f"(bubble size ∝ patients; top {label_top_n} labeled)"
+    ax.scatter(
+        rv,
+        vol,
+        s=sizes,
+        alpha=0.82,
+        c="#2563eb",
+        edgecolors="#ffffff",
+        linewidths=0.95,
+        zorder=3,
     )
-    fig.tight_layout()
-    fig.savefig(out, dpi=150)
+
+    ax.axvline(median_rate, color="#64748b", linestyle="--", linewidth=1.45, zorder=2, alpha=0.95)
+    ax.axhline(median_vol, color="#64748b", linestyle="--", linewidth=1.45, zorder=2, alpha=0.95)
+
+    ax.legend(
+        handles=[
+            Line2D(
+                [0],
+                [0],
+                color="#64748b",
+                linestyle="--",
+                linewidth=1.45,
+                label="Cohort median (revisit rate & volume)",
+            )
+        ],
+        loc="upper right",
+        bbox_to_anchor=(0.99, 0.99),
+        frameon=True,
+        fancybox=True,
+        framealpha=0.95,
+        edgecolor="#e2e8f0",
+        fontsize=11,
+    )
+
+    ax.set_yscale("log")
+    ax.yaxis.set_major_formatter(
+        mticker.FuncFormatter(lambda x, pos: f"{int(round(x)):,}" if x >= 1 else f"{float(x):g}")
+    )
+
+    qbox = dict(boxstyle="round,pad=0.32", facecolor="white", edgecolor="#e2e8f0", alpha=0.93)
+    ax.text(
+        0.79,
+        0.90,
+        "High volume +\nhigh revisit",
+        transform=ax.transAxes,
+        fontsize=10,
+        color="#334155",
+        ha="center",
+        va="center",
+        bbox=qbox,
+        zorder=4,
+    )
+    ax.text(
+        0.21,
+        0.90,
+        "Large volume,\nlower revisit",
+        transform=ax.transAxes,
+        fontsize=10,
+        color="#334155",
+        ha="center",
+        va="center",
+        bbox=qbox,
+        zorder=4,
+    )
+    ax.text(
+        0.79,
+        0.13,
+        "Smaller but\nhighly recurrent",
+        transform=ax.transAxes,
+        fontsize=10,
+        color="#334155",
+        ha="center",
+        va="center",
+        bbox=qbox,
+        zorder=4,
+    )
+    ax.text(
+        0.21,
+        0.13,
+        "Lower immediate\nplanning priority",
+        transform=ax.transAxes,
+        fontsize=10,
+        color="#334155",
+        ha="center",
+        va="center",
+        bbox=qbox,
+        zorder=4,
+    )
+
+    outline = [mpathfx.withStroke(linewidth=2.5, foreground="white")]
+    for _, row in dp.nlargest(label_top_n, "recurring_demand").iterrows():
+        t = ax.annotate(
+            _short_diag_tag(row["GroupName_disp"], max_chars=22),
+            (float(row["return_30d"]), float(row["encounters"])),
+            fontsize=6,
+            alpha=0.93,
+            color="#0f172a",
+            xytext=(5, 5),
+            textcoords="offset points",
+            zorder=5,
+        )
+        t.set_path_effects(outline)
+
+    ax.grid(True, which="major", color="#94a3b8", alpha=0.5, linewidth=1.05, linestyle="-")
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.35)
+        spine.set_color("#334155")
+
+    ax.xaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0, decimals=0))
+    ax.set_xlabel("30-day revisit rate", fontsize=11, color="#1e293b")
+    ax.set_ylabel("Encounter volume (log scale)", fontsize=11, color="#1e293b")
+
+    fig.suptitle(
+        "High-volume, high-revisit groups drive recurring 30-day demand",
+        fontsize=13,
+        fontweight="600",
+        color="#0f172a",
+        y=0.985,
+    )
+    fig.text(
+        0.5,
+        0.91,
+        "Each point = diagnosis group. Dashed lines = cohort medians. Point size scales with distinct patients. "
+        f"Labels: top {label_top_n} by encounter volume × revisit rate.",
+        ha="center",
+        fontsize=9,
+        color="#475569",
+    )
+    fig.text(0.5, 0.034, DIAG_DEMAND_FOOTNOTE, ha="center", fontsize=7, color="#64748b")
+
+    fig.tight_layout(rect=[0.02, 0.058, 0.98, 0.902])
+    fig.savefig(out, dpi=150, facecolor=fig.patch.get_facecolor())
+    plt.close(fig)
+
+
+def plot_diag_recurring_demand_bar(
+    diag_pressure: pd.DataFrame,
+    out: Path,
+    *,
+    top_n: int = 15,
+) -> None:
+    """Horizontal bar: rank diagnosis groups by encounter_volume × revisit_rate."""
+    if len(diag_pressure) == 0:
+        return
+    dp = diag_pressure.copy()
+    dp["recurring_demand"] = dp["encounters"].astype(float) * dp["return_30d"].astype(float)
+    top = dp.nlargest(top_n, "recurring_demand").sort_values("recurring_demand", ascending=True)
+
+    n = len(top)
+    fig_h = max(6.0, 0.42 * n)
+    fig, ax = plt.subplots(figsize=(10, fig_h))
+    fig.patch.set_facecolor("#ffffff")
+    ax.set_facecolor("#fafafa")
+
+    y = np.arange(n)
+    ax.barh(
+        y,
+        top["recurring_demand"].astype(float),
+        color="#1d4ed8",
+        alpha=0.9,
+        edgecolor="white",
+        linewidth=0.55,
+        height=0.72,
+    )
+    ax.set_yticks(y)
+    ax.set_yticklabels([_short_diag_tag(g, max_chars=52) for g in top["GroupName_disp"]], fontsize=10)
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, p: f"{x:,.0f}"))
+    ax.set_xlabel("Encounter volume × 30-day revisit rate (linked encounters)", fontsize=10, color="#1e293b")
+    ax.grid(True, axis="x", color="#cbd5e1", linewidth=0.9, alpha=0.85)
+    ax.set_axisbelow(True)
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.1)
+        spine.set_color("#475569")
+
+    fig.suptitle(
+        "Diagnosis groups contributing the most recurring 30-day demand",
+        fontsize=13,
+        fontweight="600",
+        color="#0f172a",
+        y=0.988,
+    )
+    fig.text(
+        0.5,
+        0.908,
+        "Bars show encounter volume × 30-day revisit rate (same ranking key as chart labels on the quadrant plot).",
+        ha="center",
+        fontsize=9,
+        color="#475569",
+    )
+    fig.text(0.5, 0.028, DIAG_DEMAND_FOOTNOTE, ha="center", fontsize=7, color="#64748b")
+    fig.tight_layout(rect=[0.02, 0.048, 0.98, 0.898])
+    fig.savefig(out, dpi=150, facecolor=fig.patch.get_facecolor())
     plt.close(fig)
 
 
@@ -780,11 +1000,9 @@ def plot_stress_heatmap(
         ax.set_yticklabels(pivot.index, fontsize=7)
         fig.colorbar(im, ax=ax, label="Stress score")
 
-    ax.set_xlabel("Month")
+    ax.set_xlabel("Time")
     ax.set_ylabel("Department specialty")
-    ax.set_title(
-        "Specialty × month stress score (encounters/provider, patients, return≤30d, diagnosis breadth)"
-    )
+    ax.set_title("Specialty × time stress score")
     fig.tight_layout()
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -972,19 +1190,13 @@ def run_all(args: argparse.Namespace) -> None:
     top_tbl = monthly_stress.sort_values("stress_score", ascending=False).head(40)
     top_tbl.to_csv(out_dir / "top_stressed_specialty_month.csv", index=False)
 
-    plot_monthly_encounters_per_provider(
-        monthly,
-        out_dir / "01_monthly_encounters_per_provider_by_specialty.png",
-        top_n_specialties=args.top_specialties_plots,
-    )
-    plot_encounters_vs_providers_scatter(
-        monthly,
-        out_dir / "02_monthly_encounters_vs_provider_count.png",
-        top_n_specialties=min(12, args.top_specialties_plots),
-    )
     plot_diag_volume_vs_return(
         diag_pressure,
         out_dir / "03_diag_volume_vs_return_30d.png",
+    )
+    plot_diag_recurring_demand_bar(
+        diag_pressure,
+        out_dir / "03_diag_recurring_demand_rank.png",
     )
     plot_stress_heatmap(
         monthly_stress,
@@ -1007,34 +1219,6 @@ def run_all(args: argparse.Namespace) -> None:
         out_dir / "05_top_diag_provider_specialty_bottlenecks.png",
         top_n=args.top_bottlenecks,
     )
-    plot_weekly_demand_z(
-        weekly,
-        out_dir / "06_weekly_demand_zscore_by_specialty.png",
-        top_n_specialties=min(8, args.top_specialties_plots),
-    )
-
-    # Simple SDOH comparison: return_30d for top diagnosis groups
-    if len(sdoh_pressure) and len(eda):
-        vc = _as_missing_str(eda["GroupName"]).value_counts()
-        top_g = list(vc.head(15).index)
-        sp = sdoh_pressure[sdoh_pressure["GroupName_disp"].isin(top_g)]
-        if len(sp) > 0:
-            pivot = sp.pivot_table(
-                index="GroupName_disp",
-                columns="transportation_need_flag",
-                values="return_30d",
-                aggfunc="mean",
-            )
-            fig, ax = plt.subplots(figsize=(9, 6))
-            pivot.plot(kind="bar", ax=ax, rot=35)
-            ax.set_ylabel("P(next visit within 30 days)")
-            ax.set_xlabel("Diagnosis group (top 15 by volume)")
-            ax.set_title("Near-term return rate: transportation SDOH flag vs not (linked pairs)")
-            ax.legend(title="Transport flag")
-            fig.tight_layout()
-            fig.savefig(out_dir / "07_sdoh_transport_return30d_top_diagnoses.png", dpi=150)
-            plt.close(fig)
-
     logger.info(
         "Resource pressure EDA finished in %.2fs — outputs under %s",
         time.perf_counter() - t0,

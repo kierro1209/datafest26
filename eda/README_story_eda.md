@@ -52,14 +52,16 @@ Or run **[run_story_eda.sh](run_story_eda.sh)** (adjust `--max-rows` / paths as 
 
 | Artifact | Description |
 |----------|-------------|
+| `08_patient_journey_clusters.png` | Patient clustering (may skip if features missing) |
 | `10_gap_bin_token_aligned_linked_pairs.png` | Gap bins match model `gap_ids` vocabulary |
 | `11_specialty_next_specialty_transition_topK.png` | Specialty → next specialty (association) |
-| `12_return_exclusive_bins_linked_pairs.png` | Mutually exclusive gap bins (linked) |
 | `13_return_within_30d_simple_linked_pairs.png` | % next within 30d by group |
-| `14_full_cohort_return_exclusive_bins.png` | Full cohort optional (terminal bucket) |
 | `05b_*`, `11b_*` | If `--transition-max-gap-days D` set |
+| `summary_*.csv` | Repeat-location + median gap summaries |
 | `pathways_top_specialty_three_step.csv` | Top 3-step specialty chains |
 | `baseline_topk_metrics.csv`, `baseline_topk_accuracy.png` | Empirical baselines |
-| Resource dir | Monthly pressure CSVs + optional quadrant PNG |
+| Resource dir (`visuals/eda_story/resource/`) | CSVs unchanged; PNGs **03–05**, optional **08** (`resource_pressure_eda.py`). Figures **01**, **02**, **06**, **07** in that folder are no longer produced (too busy / noisy for storytelling). |
 
-Use **`--no-predictability-plots`** on `journey_eda.py` to skip figures 10–14 and pathway CSV for faster legacy-only runs.
+Figures **01–07** (histograms, transition heatmaps, SDOH gap plot) and **09**, **12**, **14** are no longer emitted by default from `journey_eda.py`.
+
+Use **`--no-predictability-plots`** on `journey_eda.py` to skip figures 10–11, 13 and pathway CSV for faster runs.

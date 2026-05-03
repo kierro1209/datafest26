@@ -125,6 +125,35 @@ def _usecols_encounter_enriched() -> list[str]:
     return [c for c in _usecols_event_enriched() if c != "event_grain"]
 
 
+# Optional columns on ``event_enriched`` exports (read when present) for baselines / richer EDA.
+_OPTIONAL_EVENT_ENRICHED_COLS: tuple[str, ...] = (
+    "event_description",
+    "County",
+    "department_County",
+    "department_City",
+    "department_PostalCode",
+    "IsInpatientAdmission",
+    "IsObservation",
+    "IsHospitalOutpatientVisit",
+)
+
+
+def _merge_usecols_with_optional(path: Path, base: list[str]) -> list[str]:
+    """Append optional columns that exist in the CSV header (keeps read_csv usecols valid)."""
+    try:
+        header = list(pd.read_csv(path, nrows=0, compression="infer").columns)
+    except Exception:
+        return base
+    have = set(header)
+    seen = set(base)
+    out = list(base)
+    for c in _OPTIONAL_EVENT_ENRICHED_COLS:
+        if c in have and c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
+
+
 def load_encounters(
     path: Path,
     *,
@@ -145,9 +174,9 @@ def load_encounters(
         logger.info("Row cap: max_rows=%s (after ENCOUNTER filter for event_enriched)", max_rows)
 
     if table_kind == "event_enriched":
-        usecols = _usecols_event_enriched()
+        usecols = _merge_usecols_with_optional(path, _usecols_event_enriched())
     else:
-        usecols = _usecols_encounter_enriched()
+        usecols = _merge_usecols_with_optional(path, _usecols_encounter_enriched())
 
     read_kw: dict = {
         "filepath_or_buffer": path,
@@ -233,6 +262,9 @@ def add_next_event_columns(df: pd.DataFrame, *, inplace: bool = False) -> pd.Dat
     ]
     for cur, nxt in shift_cols:
         out[nxt] = g[cur].shift(-1)
+
+    if "event_description" in out.columns:
+        out["next_event_description"] = g["event_description"].shift(-1)
 
     out["days_to_next"] = (
         out["next_event_datetime"] - out["event_datetime"]
@@ -945,33 +977,6 @@ def run_all(args: argparse.Namespace) -> None:
             int(gtd.max()),
         )
 
-    steps = [
-        ("01_days_to_next_histogram.png", lambda: plot_histogram_days_to_next(eda, out_dir / "01_days_to_next_histogram.png")),
-        ("02_median_gap_top_diagnosis_groups.png", lambda: plot_median_gap_by_group(eda, out_dir / "02_median_gap_top_diagnosis_groups.png")),
-        ("03_return_within_7_14_30_90_by_group.png", lambda: plot_survival_style_returns(eda, out_dir / "03_return_within_7_14_30_90_by_group.png")),
-        ("04_department_type_transition_heatmap.png", lambda: plot_department_transition_heatmap(eda, out_dir / "04_department_type_transition_heatmap.png")),
-        (
-            "05_diagnosis_group_transition_heatmap.png",
-            lambda: plot_diagnosis_transition_heatmap(
-                eda,
-                out_dir / "05_diagnosis_group_transition_heatmap.png",
-                top_n=args.diagnosis_heatmap_top_n,
-            ),
-        ),
-        ("06_diagnosis_group_persistence.png", lambda: plot_diagnosis_persistence(eda, out_dir / "06_diagnosis_group_persistence.png")),
-        ("07_sdoh_transport_vs_visit_gap.png", lambda: plot_sdoh_transport_comparison(eda, out_dir / "07_sdoh_transport_vs_visit_gap.png")),
-    ]
-
-    for name, fn in steps:
-        t_step = time.perf_counter()
-        path = out_dir / name
-        fn()
-        elapsed = time.perf_counter() - t_step
-        if path.is_file():
-            logger.info("Wrote %s (%.2fs)", name, elapsed)
-        else:
-            logger.warning("Did not produce %s — plot skipped or failed (%.2fs)", name, elapsed)
-
     if args.run_predictability_plots:
         tn = args.predictability_top_n
         t_pred = time.perf_counter()
@@ -981,16 +986,9 @@ def run_all(args: argparse.Namespace) -> None:
         plot_specialty_transition_heatmap_linked_pairs(
             eda, out_dir / "11_specialty_next_specialty_transition_topK.png", top_n=tn
         )
-        plot_return_exclusive_bins_linked_pairs(
-            eda, out_dir / "12_return_exclusive_bins_linked_pairs.png", top_n=tn
-        )
         plot_return_simple30_linked_pairs(
             eda, out_dir / "13_return_within_30d_simple_linked_pairs.png", top_n=tn
         )
-        if args.full_cohort_return_chart:
-            plot_full_cohort_return_exclusive_bins(
-                df, out_dir / "14_full_cohort_return_exclusive_bins.png", top_n=tn
-            )
         if args.transition_max_gap_days is not None:
             g = int(args.transition_max_gap_days)
             eda_sub = eda[eda["days_to_next_int"].astype(float) <= g]
@@ -1027,25 +1025,6 @@ def run_all(args: argparse.Namespace) -> None:
     t_cl = time.perf_counter()
     plot_patient_clusters(df, eda, cluster_out)
     logger.info("Patient clustering step finished in %.2fs", time.perf_counter() - t_cl)
-
-    # Stratified quick views (Encounter Type)
-    t_facet = time.perf_counter()
-    type_counts = eda["Type"].fillna("(missing)").astype(str).value_counts().head(6)
-    logger.debug("Top encounter Types for facet plot: %s", dict(type_counts.head(6)))
-    fig, axes = plt.subplots(2, 3, figsize=(12, 7))
-    axes = axes.ravel()
-    for ax, (etype, _) in zip(axes, type_counts.items()):
-        sub = eda.loc[eda["Type"].fillna("(missing)").astype(str).eq(etype), "days_to_next_int"].astype(float)
-        sub = sub[(sub >= 0) & (sub <= 365)]
-        ax.hist(sub, bins=40, color="gray", edgecolor="white", linewidth=0.3)
-        ax.set_title(str(etype)[:40])
-        ax.set_xlabel("Days")
-    fig.suptitle("Days to next encounter by encounter Type (top categories)")
-    fig.tight_layout()
-    facet_path = out_dir / "09_gap_by_encounter_type_facets.png"
-    fig.savefig(facet_path, dpi=150)
-    plt.close(fig)
-    logger.info("Wrote %-45s %.2fs", facet_path.name, time.perf_counter() - t_facet)
 
     logger.info(
         "Done in %.2fs total — artifacts under %s",
@@ -1123,11 +1102,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="D",
         help="Also write horizon-filtered diagnosis/specialty heatmaps (05b, 11b) with days_to_next ≤ D.",
     )
-    p.add_argument(
-        "--no-full-cohort-return-chart",
-        action="store_true",
-        help="Skip full-cohort mutually exclusive return chart (14) when predictability plots run.",
-    )
     return p.parse_args(argv)
 
 
@@ -1138,7 +1112,6 @@ def main(argv: list[str] | None = None) -> None:
         args.max_gap_days = None
     elif args.max_gap_days is not None and args.max_gap_days < 0:
         raise SystemExit("--max-gap-days must be non-negative")
-    args.full_cohort_return_chart = not args.no_full_cohort_return_chart
     args.run_predictability_plots = not args.no_predictability_plots
     run_all(args)
 

@@ -9,6 +9,8 @@ Extracts:
   - Batch-interval running means (train / valid+test) plus final batch= lines.
   - Plots batch metrics across the full run (global batch index).
   - From training_history_snapshot.json: 2x2 Val/Test x top-1 / top-5 accuracy ({stem}_accuracy_level.png).
+
+See ``modelling/plot_model_vs_baseline.py`` for dumbbell / appendix plots vs ``baseline_topk_metrics.csv``.
 """
 
 from __future__ import annotations
