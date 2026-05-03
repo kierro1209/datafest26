@@ -461,25 +461,23 @@ def _plot_snapshot_metrics_on_ax(
     return True
 
 
-def plot_snapshot_top1_top5_2x2(
+def plot_snapshot_top1_1x2(
     snapshot: list[dict[str, Any]],
     out_path: Path,
 ) -> bool:
-    """2x2 grid: Val/Test x top-1 / top-5 accuracy from snapshot. Returns True if a file was written."""
+    """1x2 grid: Val/Test top-1 accuracy from snapshot. Returns True if a file was written."""
     eps = [row["epoch"] for row in snapshot if isinstance(row.get("epoch"), int)]
     if not eps:
         return False
 
     m_v_acc = _snapshot_metric_series(snapshot, "acc_", "valid")
     m_t_acc = _snapshot_metric_series(snapshot, "acc_", "test")
-    m_v_top = _snapshot_metric_series(snapshot, "top5_", "valid")
-    m_t_top = _snapshot_metric_series(snapshot, "top5_", "test")
-    if not (m_v_acc or m_t_acc or m_v_top or m_t_top):
+    if not (m_v_acc or m_t_acc):
         return False
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 9), sharex="col")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4.5), sharex=True)
     any_acc = _plot_snapshot_metrics_on_ax(
-        axes[0, 0],
+        axes[0],
         eps,
         m_v_acc,
         title="Val — top-1 accuracy",
@@ -487,7 +485,7 @@ def plot_snapshot_top1_top5_2x2(
         legend_strip="acc_",
     )
     any_acc_t = _plot_snapshot_metrics_on_ax(
-        axes[0, 1],
+        axes[1],
         eps,
         m_t_acc,
         title="Test — top-1 accuracy",
@@ -497,45 +495,15 @@ def plot_snapshot_top1_top5_2x2(
     if any_acc and any_acc_t:
         y0 = min(
             y
-            for ax in (axes[0, 0], axes[0, 1])
+            for ax in axes
             for y in ax.get_ylim()
         )
         y1 = max(
             y
-            for ax in (axes[0, 0], axes[0, 1])
+            for ax in axes
             for y in ax.get_ylim()
         )
-        for ax in (axes[0, 0], axes[0, 1]):
-            ax.set_ylim(y0, y1)
-
-    any_t5v = _plot_snapshot_metrics_on_ax(
-        axes[1, 0],
-        eps,
-        m_v_top,
-        title="Val — top-5 accuracy",
-        y_axis_label="accuracy",
-        legend_strip="top5_",
-    )
-    any_t5t = _plot_snapshot_metrics_on_ax(
-        axes[1, 1],
-        eps,
-        m_t_top,
-        title="Test — top-5 accuracy",
-        y_axis_label="accuracy",
-        legend_strip="top5_",
-    )
-    if any_t5v and any_t5t:
-        y0 = min(
-            y
-            for ax in (axes[1, 0], axes[1, 1])
-            for y in ax.get_ylim()
-        )
-        y1 = max(
-            y
-            for ax in (axes[1, 0], axes[1, 1])
-            for y in ax.get_ylim()
-        )
-        for ax in (axes[1, 0], axes[1, 1]):
+        for ax in axes:
             ax.set_ylim(y0, y1)
 
     fig.tight_layout()
@@ -570,7 +538,7 @@ def main() -> None:
         "--snapshot",
         type=Path,
         default=None,
-        help="Optional training_history_snapshot.json for top-1 and top-5 metric plots",
+        help="Optional training_history_snapshot.json for top-1 metric plots",
     )
     ap.add_argument(
         "--no-per-head",
@@ -622,7 +590,7 @@ def main() -> None:
     if snap_path is not None:
         snap = load_snapshot_metrics(snap_path.resolve())
         if snap:
-            plot_snapshot_top1_top5_2x2(
+            plot_snapshot_top1_1x2(
                 snap,
                 out_dir / f"{stem}_accuracy_level.png",
             )
